@@ -41,14 +41,15 @@ io.on("connection", socket => {
   // Accepts an optional ack callback so the client can tell a message was
   // actually persisted and broadcast, rather than assuming success the
   // moment it's emitted (socket.emit does not by itself confirm delivery).
-  socket.on("send_message", async ({ roomId, type = "text", text = "", fileName, mimeType, uri, size, url, title }, callback) => {
+  socket.on("send_message", async ({ roomId, type = "text", text = "", fileName, mimeType, uri, size, url, title, artist, thumbnail }, callback) => {
     const ack = typeof callback === "function" ? callback : () => {};
+    const MUSIC_LINK_PATTERN = /^https?:\/\/(open\.spotify\.com|music\.apple\.com|music\.youtube\.com|soundcloud\.com)\//i;
     try {
       const db = await helpers.loadState(); const room = db.rooms.find(r => r.id === roomId);
       if (!inRoom(room, socket.user.id)) return ack({ ok: false, error: "You are not a member of this chat." });
       if (type === "text" && !String(text).trim()) return ack({ ok: false, error: "Message is empty." });
-      if (type === "music" && !/^https?:\/\/(open\.)?spotify\.com\//i.test(String(url || ""))) return ack({ ok: false, error: "Not a valid Spotify link." });
-      const message = { id: id("msg_"), roomId, userId: socket.user.id, userName: socket.user.name, type, text: String(text || "").trim(), fileName: fileName || null, mimeType: mimeType || null, uri: uri || null, size: Number(size) || 0, url: url || null, title: title || null, createdAt: new Date().toISOString() };
+      if (type === "music" && !MUSIC_LINK_PATTERN.test(String(url || ""))) return ack({ ok: false, error: "Not a supported music link." });
+      const message = { id: id("msg_"), roomId, userId: socket.user.id, userName: socket.user.name, type, text: String(text || "").trim(), fileName: fileName || null, mimeType: mimeType || null, uri: uri || null, size: Number(size) || 0, url: url || null, title: title || null, artist: artist || null, thumbnail: thumbnail || null, createdAt: new Date().toISOString() };
       db.messages.push(message); if (db.messages.length > 5000) db.messages.splice(0, db.messages.length - 5000);
       await helpers.saveState(db);
       io.to(roomId).emit("new_message", message);
@@ -61,7 +62,7 @@ io.on("connection", socket => {
   socket.on("playback_update", async ({ roomId, playback }) => {
     const db = await helpers.loadState(); const room = db.rooms.find(r => r.id === roomId);
     if (!inRoom(room, socket.user.id) || !playback) return;
-    room.playback = { trackId: playback.trackId || null, title: playback.title || "Shared music", artist: playback.artist || "", url: playback.url || "", position: Number(playback.position) || 0, isPlaying: Boolean(playback.isPlaying), updatedBy: socket.user.name, updatedAt: Date.now() };
+    room.playback = { trackId: playback.trackId || null, title: playback.title || "Shared music", artist: playback.artist || "", url: playback.url || "", thumbnail: playback.thumbnail || null, position: Number(playback.position) || 0, isPlaying: Boolean(playback.isPlaying), updatedBy: socket.user.name, updatedAt: Date.now() };
     await helpers.saveState(db); io.to(roomId).emit("playback_changed", room.playback);
   });
 });

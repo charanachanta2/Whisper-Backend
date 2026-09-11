@@ -1,12 +1,46 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const multer = require("multer");
 const { loadState, saveState } = require("./store");
 
 const app = express();
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
 const SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || "change-me-session-secret";
 const INVITE_SECRET = process.env.INVITE_SECRET || "change-me-invite-secret";
+
+// Real attachment storage: uploaded photos, videos and files land here and
+// are served back over HTTP so every member of a chat (not just the sender)
+// can actually load them. This is a plain-disk store, which is fine for a
+// single Render instance but -- as the README's media section notes -- is
+// NOT durable across redeploys/restarts. Swap this for S3/R2/Supabase
+// Storage before relying on it for anything you can't afford to lose.
+const UPLOADS_DIR = path.join(__dirname, "..", "data", "uploads");
+fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+const MAX_UPLOAD_BYTES = 80 * 1024 * 1024; // 80MB, generous enough for a short video clip
+const ALLOWED_UPLOAD_PREFIXES = ["image/", "video/", "audio/"];
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname || "").slice(0, 10);
+      cb(null, `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`);
+    },
+  }),
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: (req, file, cb) => {
+    const okType = ALLOWED_UPLOAD_PREFIXES.some(p => (file.mimetype || "").startsWith(p)) || file.mimetype === "application/octet-stream";
+    cb(okType ? null : new Error("Unsupported file type."), okType);
+  },
+});
+// Public base URL used to build absolute attachment links (e.g. on Render,
+// set PUBLIC_BASE_URL to the same URL as your service). Falls back to
+// reading the request's own host, which works for local/dev use too.
+function publicBaseUrl(req) {
+  return (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
+}
 
 // Single deployment: this process serves both the REST API and the
 // Socket.IO realtime connection, and both are signed/verified with this one
@@ -23,6 +57,7 @@ if (INVITE_SECRET === "change-me-invite-secret") {
 
 app.use(cors({ origin: CLIENT_ORIGIN === "*" ? true : CLIENT_ORIGIN }));
 app.use(express.json({ limit: "2mb" }));
+app.use("/uploads", express.static(UPLOADS_DIR, { maxAge: "7d" }));
 
 function id(prefix = "") { return prefix + crypto.randomBytes(12).toString("hex"); }
 function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) { return { salt, hash: crypto.scryptSync(password, salt, 64).toString("hex") }; }
@@ -56,7 +91,7 @@ function getOrCreateDirectRoom(db, firstId, secondId) {
   const key = members.join(":");
   let room = db.rooms.find(r => r.directKey === key);
   if (!room) {
-    room = { id: id("room_"), name: "Direct messages", directKey: key, members, messages: [], playback: { trackId: null, title: "Nothing playing", artist: "", url: "", position: 0, isPlaying: false, updatedBy: null, updatedAt: Date.now() }, createdAt: new Date().toISOString() };
+    room = { id: id("room_"), name: "Direct messages", directKey: key, members, messages: [], playback: { trackId: null, title: "Nothing playing", artist: "", url: "", thumbnail: null, position: 0, isPlaying: false, updatedBy: null, updatedAt: Date.now() }, createdAt: new Date().toISOString() };
     db.rooms.push(room);
   }
   return room;
@@ -78,6 +113,23 @@ async function auth(req, res, next) {
 app.get("/", (req, res) => res.json({ service: "music-chat-api", status: "online" }));
 app.get("/health", async (req, res, next) => { try { await loadState(); res.json({ ok: true, service: "music-chat-server", storage: "mongodb" }); } catch (error) { next(error); } });
 app.get("/api/me", auth, (req, res) => res.json({ user: publicUser(req.user) }));
+
+// Uploads a photo, video, or file and returns the URL other members of a
+// chat can actually load. This replaces sending the sender's local
+// file:// URI as message metadata, which only ever worked on the sender's
+// own device.
+app.post("/api/upload", auth, (req, res) => {
+  upload.single("file")(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.message === "File too large" ? "That file is too large (max 80MB)." : err.message || "Upload failed." });
+    if (!req.file) return res.status(400).json({ error: "No file received." });
+    res.json({
+      url: `${publicBaseUrl(req)}/uploads/${req.file.filename}`,
+      mimeType: req.file.mimetype,
+      fileName: req.file.originalname || req.file.filename,
+      size: req.file.size,
+    });
+  });
+});
 
 app.post("/api/auth/register", async (req, res, next) => {
   try {
@@ -119,7 +171,7 @@ app.get("/api/rooms", auth, (req, res) => res.json({
     })
     .sort((a, b) => (b.lastMessage?.createdAt || "").localeCompare(a.lastMessage?.createdAt || "")),
 }));
-app.post("/api/rooms", auth, async (req, res, next) => { try { const room = { id: id("room_"), name: String(req.body?.name || "Private chat").trim().slice(0, 80), members: [req.user.id], playback: { trackId: null, title: "Nothing playing", artist: "", url: "", position: 0, isPlaying: false, updatedBy: null, updatedAt: Date.now() }, createdAt: new Date().toISOString() }; req.db.rooms.push(room); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
+app.post("/api/rooms", auth, async (req, res, next) => { try { const room = { id: id("room_"), name: String(req.body?.name || "Private chat").trim().slice(0, 80), members: [req.user.id], playback: { trackId: null, title: "Nothing playing", artist: "", url: "", thumbnail: null, position: 0, isPlaying: false, updatedBy: null, updatedAt: Date.now() }, createdAt: new Date().toISOString() }; req.db.rooms.push(room); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 app.post("/api/rooms/:roomId/invite", auth, async (req, res, next) => { try { const room = req.db.rooms.find(r => r.id === req.params.roomId); if (!room || !room.members.includes(req.user.id)) return res.status(403).json({ error: "Not a member." }); if (room.directKey) return res.status(400).json({ error: "Direct messages can't have people added. Start a room instead." }); const target = req.db.users.find(u => u.username === String(req.body?.username || "").trim().toLowerCase()); if (!target) return res.status(404).json({ error: "User not found." }); if (!room.members.includes(target.id)) room.members.push(target.id); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 
 function connected(db, firstId, secondId) { return db.friendRequests.some(r => r.status === "accepted" && ((r.fromUserId === firstId && r.toUserId === secondId) || (r.fromUserId === secondId && r.toUserId === firstId))); }
