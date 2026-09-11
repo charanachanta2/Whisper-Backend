@@ -1,51 +1,51 @@
 # Backend deployment
 
-## Simplest option: one deployment, no split secrets
+## Render — single deployment (only supported setup)
 
-`server/src/index.js` already runs the Express REST API and Socket.IO on the
-**same** process/port. Unless you specifically need Vercel's serverless REST
-API, the most reliable setup is to deploy `src/index.js` alone (e.g. to
-Render, Railway, Fly.io, a VPS, etc.) and point **both**
-`EXPO_PUBLIC_API_URL` and `EXPO_PUBLIC_SOCKET_URL` in `mobile/.env` at that
-one URL. This removes the entire class of "Unauthorized" / "User not found"
-bugs described below, because there is only ever one `ADMIN_SESSION_SECRET`,
-one `INVITE_SECRET`, and one `MONGODB_URI` in play.
+`server/src/index.js` runs the Express REST API and the Socket.IO realtime
+server together on one process/port. Deploy that one service to Render and
+point **both** `EXPO_PUBLIC_API_URL` and `EXPO_PUBLIC_SOCKET_URL` in
+`mobile/.env` at its URL.
 
-Only use the split Vercel + Render setup below if you specifically need
-Vercel's serverless REST hosting.
+This is deliberate: earlier this app was split across a Vercel REST
+deployment and a separate Render Socket.IO deployment. Vercel's serverless
+functions can't hold the persistent connection Socket.IO needs, and running
+two deployments meant `ADMIN_SESSION_SECRET`, `INVITE_SECRET`, and
+`MONGODB_URI` all had to match exactly across two separate dashboards. Any
+drift between them showed up as a login that "succeeds" over REST but then
+gets rejected the instant a chat opens, with the app forced back to the
+sign-in screen — the "session keeps expiring" symptom. Running one Render
+service for everything removes that whole class of bug: there's only ever
+one secret, one invite secret, and one database in play.
 
-## Temporary Vercel deployment
+### Setup
 
-This backend includes `api/index.js` and `vercel.json` for Vercel.
+1. Create a Render **Web Service**, `rootDir: server` (already set in
+   `render.yaml`), build command `npm install`, start command `npm start`.
+2. Set these environment variables in Render's dashboard:
+   - `ADMIN_SESSION_SECRET` — any long random string
+   - `INVITE_SECRET` — any long random string
+   - `MONGODB_URI` — your MongoDB connection string
+   - `MONGODB_DB` — defaults to `music_chat` if unset
+   - `CLIENT_ORIGIN` — `*` is fine to start; lock this down to your app's
+     origin once you're ready for production
+3. Deploy, then confirm `https://YOUR-RENDER-SERVICE.onrender.com/health`
+   returns `{"ok":true,...}`.
+4. In `mobile/.env`, set both:
+   ```
+   EXPO_PUBLIC_API_URL=https://YOUR-RENDER-SERVICE.onrender.com
+   EXPO_PUBLIC_SOCKET_URL=https://YOUR-RENDER-SERVICE.onrender.com
+   ```
+5. Generate invite codes with `npm run invite` from the `server/` folder —
+   it uses the same `.env` locally, so make sure `MONGODB_URI`,
+   `MONGODB_DB`, and `INVITE_SECRET` in your local `server/.env` match what's
+   set on Render (otherwise a code created locally won't validate against
+   the deployed database).
 
-Set these Vercel environment variables:
-- `ADMIN_SESSION_SECRET`
-- `INVITE_SECRET`
-- `MONGODB_URI`
-- `MONGODB_DB` (optional; defaults to `music_chat`)
+### Render free-tier note
 
-After deployment, test:
-- `https://YOUR-VERCEL-DOMAIN/health`
-- `https://YOUR-VERCEL-DOMAIN/`
-
-### Important limitation
-Vercel serverless functions are not suitable for the persistent Socket.IO server used by realtime chat. The Vercel entrypoint is therefore REST-only. The persistent `src/index.js` remains included for the later Render deployment.
-
-All accounts, invitation codes, rooms, and messages are stored in MongoDB. Add the same `MONGODB_URI`, `MONGODB_DB`, and `INVITE_SECRET` to your local `server/.env` before running `npm run invite`. This makes the generated invitation available to the deployed Vercel API.
-
-## Later Render deployment
-
-Use the existing `src/index.js` and `render.yaml`. That process starts Express + Socket.IO and is the preferred realtime deployment. Point the mobile app's `EXPO_PUBLIC_API_URL` to the Render service URL.
-
-For the split Vercel + Render setup, keep `EXPO_PUBLIC_API_URL` pointed at
-Vercel and set `EXPO_PUBLIC_SOCKET_URL` to the Render service URL instead.
-Use `.env.render.example` as the Render environment-variable checklist.
-
-### Avoiding "User not found" errors
-`ADMIN_SESSION_SECRET`, `INVITE_SECRET`, `MONGODB_URI`, and `MONGODB_DB` must
-be **exactly the same** on Vercel and on Render. If they differ, a login
-completed against Vercel produces a valid session token, but the Render
-Socket.IO server looks the user up in a different database (or can't verify
-the token) and rejects it with "User not found" / "Unauthorized" as soon as
-you open a chat. Double-check both dashboards have identical values for all
-four variables whenever you rotate a secret or database.
+Free Render web services spin down after periods of inactivity and take a
+few seconds to wake back up on the next request — the first login or socket
+connect after idle time may be slow or briefly fail before Render finishes
+starting the instance. That's expected on the free tier, not a bug; a paid
+instance stays warm.

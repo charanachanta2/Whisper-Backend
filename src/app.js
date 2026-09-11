@@ -8,16 +8,14 @@ const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
 const SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || "change-me-session-secret";
 const INVITE_SECRET = process.env.INVITE_SECRET || "change-me-invite-secret";
 
-// This app is commonly split across two deployments (e.g. Vercel for the
-// REST API, Render for the persistent Socket.IO connection). Both processes
-// sign/verify tokens with SESSION_SECRET and read/write the same Mongo
-// database, so if either value differs between deployments, tokens minted by
-// one will fail to verify on the other -- which shows up in the app as a
-// generic "Unauthorized" error the moment a chat is opened. Warn loudly on
-// boot instead of failing silently, since this is the single most common
-// cause of that report.
+// Single deployment: this process serves both the REST API and the
+// Socket.IO realtime connection, and both are signed/verified with this one
+// SESSION_SECRET. (Earlier this app supported splitting REST and sockets
+// across two separate deployments -- that mode is no longer used, since any
+// drift between the two secrets caused logins to "succeed" over REST and
+// then get silently rejected the moment a chat opened.)
 if (SESSION_SECRET === "change-me-session-secret") {
-  console.warn("[config] ADMIN_SESSION_SECRET is unset (using an insecure default). If your REST API and Socket.IO server run as separate deployments, set the SAME ADMIN_SESSION_SECRET on both or every login will fail to authenticate the chat socket with \"Unauthorized\".");
+  console.warn("[config] ADMIN_SESSION_SECRET is unset (using an insecure default). Set a real value in production -- this signs every login token.");
 }
 if (INVITE_SECRET === "change-me-invite-secret") {
   console.warn("[config] INVITE_SECRET is unset (using an insecure default). Set a real value in production.");
