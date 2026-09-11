@@ -26,3 +26,12 @@ Use the existing `src/index.js` and `render.yaml`. That process starts Express +
 For the split Vercel + Render setup, keep `EXPO_PUBLIC_API_URL` pointed at
 Vercel and set `EXPO_PUBLIC_SOCKET_URL` to the Render service URL instead.
 Use `.env.render.example` as the Render environment-variable checklist.
+
+### Avoiding "User not found" errors
+`ADMIN_SESSION_SECRET`, `INVITE_SECRET`, `MONGODB_URI`, and `MONGODB_DB` must
+be **exactly the same** on Vercel and on Render. If they differ, a login
+completed against Vercel produces a valid session token, but the Render
+Socket.IO server looks the user up in a different database (or can't verify
+the token) and rejects it with "User not found" / "Unauthorized" as soon as
+you open a chat. Double-check both dashboards have identical values for all
+four variables whenever you rotate a secret or database.
