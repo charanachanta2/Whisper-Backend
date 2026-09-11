@@ -26,9 +26,17 @@ io.on("connection", socket => {
   socket.on("join_room", async ({ roomId }) => {
     const db = await helpers.loadState(); const room = db.rooms.find(r => r.id === roomId);
     if (!inRoom(room, socket.user.id)) return socket.emit("error_message", "You are not a member of this chat.");
+    // Support one live socket per user across room switches: leave whatever
+    // room this socket was previously in so events don't keep flowing to a
+    // screen the person has navigated away from.
+    if (socket.data.roomId && socket.data.roomId !== roomId) socket.leave(socket.data.roomId);
     socket.join(roomId); socket.data.roomId = roomId;
-    const state = helpers.roomForClient(db, room);
+    const state = helpers.roomForClient(db, room, socket.user.id);
     socket.emit("room_state", state); io.to(roomId).emit("members_changed", state.members);
+  });
+  socket.on("leave_room", ({ roomId }) => {
+    if (roomId) socket.leave(roomId);
+    if (socket.data.roomId === roomId) socket.data.roomId = null;
   });
   socket.on("send_message", async ({ roomId, type = "text", text = "", fileName, mimeType, uri, size, url, title }) => {
     const db = await helpers.loadState(); const room = db.rooms.find(r => r.id === roomId);

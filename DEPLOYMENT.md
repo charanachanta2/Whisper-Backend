@@ -1,5 +1,19 @@
 # Backend deployment
 
+## Simplest option: one deployment, no split secrets
+
+`server/src/index.js` already runs the Express REST API and Socket.IO on the
+**same** process/port. Unless you specifically need Vercel's serverless REST
+API, the most reliable setup is to deploy `src/index.js` alone (e.g. to
+Render, Railway, Fly.io, a VPS, etc.) and point **both**
+`EXPO_PUBLIC_API_URL` and `EXPO_PUBLIC_SOCKET_URL` in `mobile/.env` at that
+one URL. This removes the entire class of "Unauthorized" / "User not found"
+bugs described below, because there is only ever one `ADMIN_SESSION_SECRET`,
+one `INVITE_SECRET`, and one `MONGODB_URI` in play.
+
+Only use the split Vercel + Render setup below if you specifically need
+Vercel's serverless REST hosting.
+
 ## Temporary Vercel deployment
 
 This backend includes `api/index.js` and `vercel.json` for Vercel.

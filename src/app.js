@@ -8,6 +8,21 @@ const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
 const SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || "change-me-session-secret";
 const INVITE_SECRET = process.env.INVITE_SECRET || "change-me-invite-secret";
 
+// This app is commonly split across two deployments (e.g. Vercel for the
+// REST API, Render for the persistent Socket.IO connection). Both processes
+// sign/verify tokens with SESSION_SECRET and read/write the same Mongo
+// database, so if either value differs between deployments, tokens minted by
+// one will fail to verify on the other -- which shows up in the app as a
+// generic "Unauthorized" error the moment a chat is opened. Warn loudly on
+// boot instead of failing silently, since this is the single most common
+// cause of that report.
+if (SESSION_SECRET === "change-me-session-secret") {
+  console.warn("[config] ADMIN_SESSION_SECRET is unset (using an insecure default). If your REST API and Socket.IO server run as separate deployments, set the SAME ADMIN_SESSION_SECRET on both or every login will fail to authenticate the chat socket with \"Unauthorized\".");
+}
+if (INVITE_SECRET === "change-me-invite-secret") {
+  console.warn("[config] INVITE_SECRET is unset (using an insecure default). Set a real value in production.");
+}
+
 app.use(cors({ origin: CLIENT_ORIGIN === "*" ? true : CLIENT_ORIGIN }));
 app.use(express.json({ limit: "2mb" }));
 
@@ -17,7 +32,37 @@ function verifyPassword(password, user) { return crypto.scryptSync(password, use
 function sign(payload) { const body = Buffer.from(JSON.stringify(payload)).toString("base64url"); const sig = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url"); return `${body}.${sig}`; }
 function verify(token) { if (!token) return null; try { const [body, sig] = token.split("."); const expected = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url"); if (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; const data = JSON.parse(Buffer.from(body, "base64url").toString()); return data.exp > Date.now() ? data : null; } catch (_) { return null; } }
 function publicUser(user) { return { id: user.id, username: user.username, name: user.name }; }
-function roomForClient(db, room) { return { id: room.id, name: room.name, memberCount: room.members.length, members: room.members.map(uid => db.users.find(u => u.id === uid)).filter(Boolean).map(publicUser), messages: db.messages.filter(m => m.roomId === room.id).slice(-200), playback: room.playback }; }
+// `viewerId` lets us resolve a friendlier name/avatar for 1:1 rooms: instead
+// of the generic "Direct messages" label, the client can show the other
+// person's name.
+function roomForClient(db, room, viewerId) {
+  const isDirect = Boolean(room.directKey);
+  const otherUserId = isDirect ? room.members.find(uid => uid !== viewerId) : null;
+  const otherUser = otherUserId ? db.users.find(u => u.id === otherUserId) : null;
+  return {
+    id: room.id,
+    name: room.name,
+    isDirect,
+    otherUser: otherUser ? publicUser(otherUser) : null,
+    memberCount: room.members.length,
+    members: room.members.map(uid => db.users.find(u => u.id === uid)).filter(Boolean).map(publicUser),
+    messages: db.messages.filter(m => m.roomId === room.id).slice(-200),
+    playback: room.playback,
+  };
+}
+// Shared by the friend-request-accept flow and the "message this friend"
+// flow so both always resolve to the same 1:1 room instead of creating
+// duplicates.
+function getOrCreateDirectRoom(db, firstId, secondId) {
+  const members = [firstId, secondId].sort();
+  const key = members.join(":");
+  let room = db.rooms.find(r => r.directKey === key);
+  if (!room) {
+    room = { id: id("room_"), name: "Direct messages", directKey: key, members, messages: [], playback: { trackId: null, title: "Nothing playing", artist: "", url: "", position: 0, isPlaying: false, updatedBy: null, updatedAt: Date.now() }, createdAt: new Date().toISOString() };
+    db.rooms.push(room);
+  }
+  return room;
+}
 
 async function auth(req, res, next) {
   try {
@@ -56,12 +101,45 @@ app.post("/api/auth/register", async (req, res, next) => {
 });
 
 app.post("/api/auth/login", async (req, res, next) => { try { const db = await loadState(); const normalized = String(req.body?.username || "").trim().toLowerCase(); const user = db.users.find(u => u.username === normalized); if (!user || !verifyPassword(String(req.body?.password || ""), user)) return res.status(401).json({ error: "Invalid username or password." }); res.json({ token: sign({ userId: user.id, exp: Date.now() + 1000 * 60 * 60 * 24 * 30 }), user: publicUser(user) }); } catch (error) { next(error); } });
-app.get("/api/rooms", auth, (req, res) => res.json({ rooms: req.db.rooms.filter(r => r.members.includes(req.user.id)).map(r => ({ id: r.id, name: r.name, memberCount: r.members.length })) }));
-app.post("/api/rooms", auth, async (req, res, next) => { try { const room = { id: id("room_"), name: String(req.body?.name || "Private chat").trim().slice(0, 80), members: [req.user.id], playback: { trackId: null, title: "Nothing playing", artist: "", url: "", position: 0, isPlaying: false, updatedBy: null, updatedAt: Date.now() }, createdAt: new Date().toISOString() }; req.db.rooms.push(room); await saveState(req.db); res.json({ room: roomForClient(req.db, room) }); } catch (error) { next(error); } });
-app.post("/api/rooms/:roomId/invite", auth, async (req, res, next) => { try { const room = req.db.rooms.find(r => r.id === req.params.roomId); if (!room || !room.members.includes(req.user.id)) return res.status(403).json({ error: "Not a member." }); const target = req.db.users.find(u => u.username === String(req.body?.username || "").trim().toLowerCase()); if (!target) return res.status(404).json({ error: "User not found." }); if (!room.members.includes(target.id)) room.members.push(target.id); await saveState(req.db); res.json({ room: roomForClient(req.db, room) }); } catch (error) { next(error); } });
+app.get("/api/rooms", auth, (req, res) => res.json({
+  rooms: req.db.rooms
+    .filter(r => r.members.includes(req.user.id))
+    .map(r => {
+      const isDirect = Boolean(r.directKey);
+      const otherUserId = isDirect ? r.members.find(uid => uid !== req.user.id) : null;
+      const otherUser = otherUserId ? req.db.users.find(u => u.id === otherUserId) : null;
+      const roomMessages = req.db.messages.filter(m => m.roomId === r.id);
+      const lastMessage = roomMessages[roomMessages.length - 1] || null;
+      return {
+        id: r.id,
+        name: isDirect && otherUser ? otherUser.name : r.name,
+        isDirect,
+        otherUser: otherUser ? publicUser(otherUser) : null,
+        memberCount: r.members.length,
+        lastMessage: lastMessage ? { text: lastMessage.text, type: lastMessage.type, createdAt: lastMessage.createdAt, userName: lastMessage.userName } : null,
+      };
+    })
+    .sort((a, b) => (b.lastMessage?.createdAt || "").localeCompare(a.lastMessage?.createdAt || "")),
+}));
+app.post("/api/rooms", auth, async (req, res, next) => { try { const room = { id: id("room_"), name: String(req.body?.name || "Private chat").trim().slice(0, 80), members: [req.user.id], playback: { trackId: null, title: "Nothing playing", artist: "", url: "", position: 0, isPlaying: false, updatedBy: null, updatedAt: Date.now() }, createdAt: new Date().toISOString() }; req.db.rooms.push(room); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
+app.post("/api/rooms/:roomId/invite", auth, async (req, res, next) => { try { const room = req.db.rooms.find(r => r.id === req.params.roomId); if (!room || !room.members.includes(req.user.id)) return res.status(403).json({ error: "Not a member." }); if (room.directKey) return res.status(400).json({ error: "Direct messages can't have people added. Start a room instead." }); const target = req.db.users.find(u => u.username === String(req.body?.username || "").trim().toLowerCase()); if (!target) return res.status(404).json({ error: "User not found." }); if (!room.members.includes(target.id)) room.members.push(target.id); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 
 function connected(db, firstId, secondId) { return db.friendRequests.some(r => r.status === "accepted" && ((r.fromUserId === firstId && r.toUserId === secondId) || (r.fromUserId === secondId && r.toUserId === firstId))); }
 function socialUser(user) { return { id: user.id, username: user.username, name: user.name }; }
+
+// Opens (or creates) the 1:1 chat with an existing friend. This is what
+// lets someone message a friend directly from search/discover instead of
+// only ever landing in a DM by accepting a fresh request.
+app.post("/api/dm/:userId", auth, async (req, res, next) => {
+  try {
+    const target = req.db.users.find(u => u.id === req.params.userId);
+    if (!target || target.id === req.user.id) return res.status(404).json({ error: "User not found." });
+    if (!connected(req.db, req.user.id, target.id)) return res.status(403).json({ error: "You need to be friends before you can message them." });
+    const room = getOrCreateDirectRoom(req.db, req.user.id, target.id);
+    await saveState(req.db);
+    res.json({ room: roomForClient(req.db, room, req.user.id) });
+  } catch (error) { next(error); }
+});
 
 app.get("/api/users/search", auth, (req, res) => {
   const query = String(req.query.q || "").trim().toLowerCase();
@@ -71,7 +149,7 @@ app.get("/api/users/search", auth, (req, res) => {
 });
 app.get("/api/friends/requests", auth, (req, res) => res.json({ incoming: req.db.friendRequests.filter(r => r.toUserId === req.user.id && r.status === "pending").map(r => ({ ...r, from: socialUser(req.db.users.find(u => u.id === r.fromUserId)) })), outgoing: req.db.friendRequests.filter(r => r.fromUserId === req.user.id && r.status === "pending") }));
 app.post("/api/friends/requests", auth, async (req, res, next) => { try { const username = String(req.body?.username || "").trim().toLowerCase(); const userId = String(req.body?.userId || "").trim(); const target = req.db.users.find(u => u.id === userId) || req.db.users.find(u => u.username === username); if (!target || target.id === req.user.id) return res.status(404).json({ error: "User not found." }); if (connected(req.db, req.user.id, target.id) || req.db.friendRequests.some(r => r.status === "pending" && ((r.fromUserId === req.user.id && r.toUserId === target.id) || (r.fromUserId === target.id && r.toUserId === req.user.id)))) return res.status(409).json({ error: "A request already exists." }); const request = { id: id("req_"), fromUserId: req.user.id, toUserId: target.id, status: "pending", createdAt: new Date().toISOString() }; req.db.friendRequests.push(request); await saveState(req.db); res.json({ request }); } catch (error) { next(error); } });
-app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next) => { try { const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending"); if (!request) return res.status(404).json({ error: "Request not found." }); request.status = "accepted"; request.acceptedAt = new Date().toISOString(); const members = [request.fromUserId, request.toUserId].sort(); let room = req.db.rooms.find(r => r.directKey === members.join(":")); if (!room) { room = { id: id("room_"), name: "Direct messages", directKey: members.join(":"), members, messages: [], playback: { title: "Nothing playing", isPlaying: false }, createdAt: new Date().toISOString() }; req.db.rooms.push(room); } await saveState(req.db); res.json({ room: roomForClient(req.db, room) }); } catch (error) { next(error); } });
+app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next) => { try { const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending"); if (!request) return res.status(404).json({ error: "Request not found." }); request.status = "accepted"; request.acceptedAt = new Date().toISOString(); const room = getOrCreateDirectRoom(req.db, request.fromUserId, request.toUserId); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 app.get("/api/posts", auth, (req, res) => res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || connected(req.db, req.user.id, p.userId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100) }));
 app.post("/api/posts", auth, async (req, res, next) => { try { const text = String(req.body?.text || "").trim().slice(0, 2000); const media = req.body?.media || null; if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." }); const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, createdAt: new Date().toISOString() }; req.db.posts.push(post); await saveState(req.db); res.json({ post }); } catch (error) { next(error); } });
 app.get("/api/stories", auth, (req, res) => res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || connected(req.db, req.user.id, s.userId))) }));
