@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: music-chat-server
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: ADMIN_SESSION_SECRET
+        sync: false
+      - key: INVITE_SECRET
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: music_chat
+      - key: CLIENT_ORIGIN
+        sync: false

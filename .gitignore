@@ -1,0 +1,14 @@
+node_modules/
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env.*.example
+
+# Legacy local JSON data; production uses MongoDB.
+data/db.json
+
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
