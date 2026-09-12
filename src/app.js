@@ -56,7 +56,15 @@ if (INVITE_SECRET === "change-me-invite-secret") {
 }
 
 app.use(cors({ origin: CLIENT_ORIGIN === "*" ? true : CLIENT_ORIGIN }));
-app.use(express.json({ limit: "2mb" }));
+// /api/upload is deliberately excluded here and given its own, much larger
+// limit further down -- a base64-encoded photo/video body can be well over
+// this 2mb cap, and Express's body parser enforces whichever limit runs
+// first, so leaving that route in this one would reject large uploads
+// before they ever reached the route's own parser.
+app.use((req, res, next) => {
+  if (req.path === "/api/upload") return next();
+  express.json({ limit: "2mb" })(req, res, next);
+});
 app.use("/uploads", express.static(UPLOADS_DIR, { maxAge: "7d" }));
 
 function id(prefix = "") { return prefix + crypto.randomBytes(12).toString("hex"); }
@@ -118,7 +126,42 @@ app.get("/api/me", auth, (req, res) => res.json({ user: publicUser(req.user) }))
 // chat can actually load. This replaces sending the sender's local
 // file:// URI as message metadata, which only ever worked on the sender's
 // own device.
-app.post("/api/upload", auth, (req, res) => {
+//
+// Accepts two shapes:
+//  - application/json: { fileName, mimeType, data: base64 } -- this is what
+//    the app itself sends now (see uploadAsset() in mobile/App.js). Kept as
+//    plain JSON deliberately, since native multipart/FormData encoding on
+//    the client has repeatedly broken across RN/Expo versions.
+//  - multipart/form-data with a "file" field -- kept only for backward
+//    compatibility with any older client build still out there.
+// A larger body-size limit is scoped to just this route (via the
+// middleware below) rather than raised globally, since a base64 video can
+// be ~1.4x its raw byte size.
+const uploadJsonLimit = express.json({ limit: "110mb" });
+app.post("/api/upload", auth, uploadJsonLimit, (req, res) => {
+  const contentType = req.headers["content-type"] || "";
+  if (contentType.startsWith("application/json")) {
+    try {
+      const { fileName, mimeType, data } = req.body || {};
+      if (!data) return res.status(400).json({ error: "No file received." });
+      const type = mimeType || "application/octet-stream";
+      const okType = ALLOWED_UPLOAD_PREFIXES.some(p => type.startsWith(p)) || type === "application/octet-stream";
+      if (!okType) return res.status(400).json({ error: "Unsupported file type." });
+      const buffer = Buffer.from(data, "base64");
+      if (buffer.length > MAX_UPLOAD_BYTES) return res.status(400).json({ error: "That file is too large (max 80MB)." });
+      const ext = path.extname(fileName || "").slice(0, 10);
+      const filename = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
+      fs.writeFileSync(path.join(UPLOADS_DIR, filename), buffer);
+      return res.json({
+        url: `${publicBaseUrl(req)}/uploads/${filename}`,
+        mimeType: type,
+        fileName: fileName || filename,
+        size: buffer.length,
+      });
+    } catch (error) {
+      return res.status(500).json({ error: "Upload failed." });
+    }
+  }
   upload.single("file")(req, res, (err) => {
     if (err) return res.status(400).json({ error: err.message === "File too large" ? "That file is too large (max 80MB)." : err.message || "Upload failed." });
     if (!req.file) return res.status(400).json({ error: "No file received." });
