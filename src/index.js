@@ -9,6 +9,17 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN } });
 const id = (prefix = "") => prefix + crypto.randomBytes(12).toString("hex");
 const inRoom = (room, userId) => room && room.members.includes(userId);
+// Presence for voice rooms: who's currently joined, whether their mic is
+// muted, and whether they've flagged themselves as sharing audio. This is
+// in-memory only (not persisted) since it's live call state, not chat
+// history -- it resets whenever the server restarts, same as who's
+// currently "online" would.
+const voicePresence = new Map(); // roomId -> Map(userId -> { name, muted, sharingAudio })
+
+function voiceState(roomId) {
+  const participants = voicePresence.get(roomId);
+  return participants ? Array.from(participants.values()) : [];
+}
 
 io.use(async (socket, next) => {
   try {
@@ -59,11 +70,48 @@ io.on("connection", socket => {
       ack({ ok: false, error: "Server storage is unavailable. Please try again." });
     }
   });
-  socket.on("playback_update", async ({ roomId, playback }) => {
+  // --- Voice rooms ---
+  // Joining/leaving a voice room is separate from join_room/leave_room
+  // (which are for the text-chat socket room a screen is currently
+  // looking at) -- a voice room tracks who's actually "in the call" with
+  // their mic/sharing state, and that has to survive the person swiping
+  // to another tab without hanging up.
+  socket.on("voice_join", async ({ roomId }) => {
     const db = await helpers.loadState(); const room = db.rooms.find(r => r.id === roomId);
-    if (!inRoom(room, socket.user.id) || !playback) return;
-    room.playback = { trackId: playback.trackId || null, title: playback.title || "Shared music", artist: playback.artist || "", url: playback.url || "", thumbnail: playback.thumbnail || null, position: Number(playback.position) || 0, isPlaying: Boolean(playback.isPlaying), updatedBy: socket.user.name, updatedAt: Date.now() };
-    await helpers.saveState(db); io.to(roomId).emit("playback_changed", room.playback);
+    if (!inRoom(room, socket.user.id) || !room.isVoice) return socket.emit("error_message", "You are not a member of this voice room.");
+    socket.join(`voice:${roomId}`); socket.data.voiceRoomId = roomId;
+    if (!voicePresence.has(roomId)) voicePresence.set(roomId, new Map());
+    voicePresence.get(roomId).set(socket.user.id, { userId: socket.user.id, name: socket.user.name, muted: false, sharingAudio: false });
+    io.to(`voice:${roomId}`).emit("voice_participants", voiceState(roomId));
+  });
+  socket.on("voice_leave", ({ roomId }) => {
+    if (!roomId) return;
+    socket.leave(`voice:${roomId}`);
+    if (socket.data.voiceRoomId === roomId) socket.data.voiceRoomId = null;
+    const participants = voicePresence.get(roomId);
+    if (participants) {
+      participants.delete(socket.user.id);
+      if (participants.size === 0) voicePresence.delete(roomId);
+    }
+    io.to(`voice:${roomId}`).emit("voice_participants", voiceState(roomId));
+  });
+  socket.on("voice_update", ({ roomId, muted, sharingAudio }) => {
+    const participants = voicePresence.get(roomId);
+    const me = participants?.get(socket.user.id);
+    if (!me) return;
+    if (typeof muted === "boolean") me.muted = muted;
+    if (typeof sharingAudio === "boolean") me.sharingAudio = sharingAudio;
+    io.to(`voice:${roomId}`).emit("voice_participants", voiceState(roomId));
+  });
+  socket.on("disconnect", () => {
+    const roomId = socket.data.voiceRoomId;
+    if (!roomId) return;
+    const participants = voicePresence.get(roomId);
+    if (participants) {
+      participants.delete(socket.user.id);
+      if (participants.size === 0) voicePresence.delete(roomId);
+    }
+    io.to(`voice:${roomId}`).emit("voice_participants", voiceState(roomId));
   });
 });
 

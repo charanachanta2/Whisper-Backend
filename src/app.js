@@ -93,11 +93,11 @@ function roomForClient(db, room, viewerId) {
     id: room.id,
     name: room.name,
     isDirect,
+    isVoice: Boolean(room.isVoice),
     otherUser: otherUser ? publicUser(otherUser) : null,
     memberCount: room.members.length,
     members: room.members.map(uid => db.users.find(u => u.id === uid)).filter(Boolean).map(publicUser),
     messages: db.messages.filter(m => m.roomId === room.id).slice(-200),
-    playback: room.playback,
   };
 }
 // Shared by the friend-request-accept flow and the "message this friend"
@@ -108,7 +108,7 @@ function getOrCreateDirectRoom(db, firstId, secondId) {
   const key = members.join(":");
   let room = db.rooms.find(r => r.directKey === key);
   if (!room) {
-    room = { id: id("room_"), name: "Direct messages", directKey: key, members, messages: [], playback: { trackId: null, title: "Nothing playing", artist: "", url: "", thumbnail: null, position: 0, isPlaying: false, updatedBy: null, updatedAt: Date.now() }, createdAt: new Date().toISOString() };
+    room = { id: id("room_"), name: "Direct messages", directKey: key, members, messages: [], createdAt: new Date().toISOString() };
     db.rooms.push(room);
   }
   return room;
@@ -230,6 +230,7 @@ app.get("/api/rooms", auth, (req, res) => res.json({
         id: r.id,
         name: isDirect && otherUser ? otherUser.name : r.name,
         isDirect,
+        isVoice: Boolean(r.isVoice),
         otherUser: otherUser ? publicUser(otherUser) : null,
         memberCount: r.members.length,
         lastMessage: lastMessage ? { text: lastMessage.text, type: lastMessage.type, createdAt: lastMessage.createdAt, userName: lastMessage.userName } : null,
@@ -237,7 +238,7 @@ app.get("/api/rooms", auth, (req, res) => res.json({
     })
     .sort((a, b) => (b.lastMessage?.createdAt || "").localeCompare(a.lastMessage?.createdAt || "")),
 }));
-app.post("/api/rooms", auth, async (req, res, next) => { try { const room = { id: id("room_"), name: String(req.body?.name || "Private chat").trim().slice(0, 80), members: [req.user.id], playback: { trackId: null, title: "Nothing playing", artist: "", url: "", thumbnail: null, position: 0, isPlaying: false, updatedBy: null, updatedAt: Date.now() }, createdAt: new Date().toISOString() }; req.db.rooms.push(room); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
+app.post("/api/rooms", auth, async (req, res, next) => { try { const isVoice = Boolean(req.body?.isVoice); const room = { id: id("room_"), name: String(req.body?.name || (isVoice ? "Voice room" : "Private chat")).trim().slice(0, 80), members: [req.user.id], isVoice, createdAt: new Date().toISOString() }; req.db.rooms.push(room); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 app.post("/api/rooms/:roomId/invite", auth, async (req, res, next) => { try { const room = req.db.rooms.find(r => r.id === req.params.roomId); if (!room || !room.members.includes(req.user.id)) return res.status(403).json({ error: "Not a member." }); if (room.directKey) return res.status(400).json({ error: "Direct messages can't have people added. Start a room instead." }); const target = req.db.users.find(u => u.username === String(req.body?.username || "").trim().toLowerCase()); if (!target) return res.status(404).json({ error: "User not found." }); if (!room.members.includes(target.id)) room.members.push(target.id); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 
 function connected(db, firstId, secondId) { return db.friendRequests.some(r => r.status === "accepted" && ((r.fromUserId === firstId && r.toUserId === secondId) || (r.fromUserId === secondId && r.toUserId === firstId))); }
