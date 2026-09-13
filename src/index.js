@@ -9,6 +9,17 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN } });
 const id = (prefix = "") => prefix + crypto.randomBytes(12).toString("hex");
 const inRoom = (room, userId) => room && room.members.includes(userId);
+// Presence for voice rooms: who's currently joined, whether their mic is
+// muted, and whether they've flagged themselves as sharing audio. This is
+// in-memory only (not persisted) since it's live call state, not chat
+// history -- it resets whenever the server restarts, same as who's
+// currently "online" would.
+const voicePresence = new Map(); // roomId -> Map(userId -> { name, muted, sharingAudio })
+
+function voiceState(roomId) {
+  const participants = voicePresence.get(roomId);
+  return participants ? Array.from(participants.values()) : [];
+}
 
 io.use(async (socket, next) => {
   try {
@@ -60,26 +71,48 @@ io.on("connection", socket => {
     }
   });
   // --- Voice rooms ---
-  // Real audio for voice rooms is now handled entirely by LiveKit (see
-  // POST /api/voice/token in app.js) -- LiveKit's own Room object tracks
-  // who's actually connected and their live mute state, which is the real
-  // thing rather than a self-reported flag. This socket used to maintain a
-  // separate, purely cosmetic presence list for voice rooms (voice_join /
-  // voice_leave / voice_update); that's been removed since LiveKit's
-  // participant data replaces it and keeping both around would just be two
-  // sources of truth that could disagree.
+  // Joining/leaving a voice room is separate from join_room/leave_room
+  // (which are for the text-chat socket room a screen is currently
+  // looking at) -- a voice room tracks who's actually "in the call" with
+  // their mic/sharing state, and that has to survive the person swiping
+  // to another tab without hanging up.
+  socket.on("voice_join", async ({ roomId }) => {
+    const db = await helpers.loadState(); const room = db.rooms.find(r => r.id === roomId);
+    if (!inRoom(room, socket.user.id) || !room.isVoice) return socket.emit("error_message", "You are not a member of this voice room.");
+    socket.join(`voice:${roomId}`); socket.data.voiceRoomId = roomId;
+    if (!voicePresence.has(roomId)) voicePresence.set(roomId, new Map());
+    voicePresence.get(roomId).set(socket.user.id, { userId: socket.user.id, name: socket.user.name, muted: false, sharingAudio: false });
+    io.to(`voice:${roomId}`).emit("voice_participants", voiceState(roomId));
+  });
+  socket.on("voice_leave", ({ roomId }) => {
+    if (!roomId) return;
+    socket.leave(`voice:${roomId}`);
+    if (socket.data.voiceRoomId === roomId) socket.data.voiceRoomId = null;
+    const participants = voicePresence.get(roomId);
+    if (participants) {
+      participants.delete(socket.user.id);
+      if (participants.size === 0) voicePresence.delete(roomId);
+    }
+    io.to(`voice:${roomId}`).emit("voice_participants", voiceState(roomId));
+  });
+  socket.on("voice_update", ({ roomId, muted, sharingAudio }) => {
+    const participants = voicePresence.get(roomId);
+    const me = participants?.get(socket.user.id);
+    if (!me) return;
+    if (typeof muted === "boolean") me.muted = muted;
+    if (typeof sharingAudio === "boolean") me.sharingAudio = sharingAudio;
+    io.to(`voice:${roomId}`).emit("voice_participants", voiceState(roomId));
+  });
+  socket.on("disconnect", () => {
+    const roomId = socket.data.voiceRoomId;
+    if (!roomId) return;
+    const participants = voicePresence.get(roomId);
+    if (participants) {
+      participants.delete(socket.user.id);
+      if (participants.size === 0) voicePresence.delete(roomId);
+    }
+    io.to(`voice:${roomId}`).emit("voice_participants", voiceState(roomId));
+  });
 });
 
 server.listen(PORT, "0.0.0.0", () => console.log(`Music Chat backend listening on ${PORT}`));
-
-// Render sends SIGTERM before stopping/restarting an instance (deploys,
-// free-tier spin-down). The state store debounces its writes to Mongo (see
-// store.js), so without this, whatever was saved in the last ~300ms-5s
-// before shutdown could be lost. This flushes it first.
-async function gracefulShutdown() {
-  try { await helpers.shutdown(); } catch (_) {}
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 3000).unref();
-}
-process.on("SIGTERM", gracefulShutdown);
-process.on("SIGINT", gracefulShutdown);

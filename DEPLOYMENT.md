@@ -49,33 +49,3 @@ few seconds to wake back up on the next request — the first login or socket
 connect after idle time may be slow or briefly fail before Render finishes
 starting the instance. That's expected on the free tier, not a bug; a paid
 instance stays warm.
-
-## Voice chat (LiveKit)
-
-Voice rooms previously only tracked who had "joined" — no audio was ever
-actually captured or sent. Real audio needs WebRTC, and specifically a TURN
-relay server for it to work reliably across different networks/NATs — and
-that's the one piece Render's free tier genuinely cannot host itself, since
-TURN needs raw UDP and Render's free web services only accept HTTP(S). This
-app now uses [LiveKit Cloud](https://cloud.livekit.io) to handle that part;
-this Render service's only job is to prove someone is really a member of a
-voice room before handing them a scoped token — the audio itself never
-touches Render at all.
-
-1. Create a free LiveKit Cloud account/project at
-   [cloud.livekit.io](https://cloud.livekit.io) (the free tier is generous
-   for a small app — check their current pricing page for limits).
-2. In the project's **Settings → Keys**, copy the API Key, API Secret, and
-   the **WebSocket URL** (starts with `wss://`, not `https://`).
-3. Set three env vars on Render (already in `render.yaml`):
-   - `LIVEKIT_API_KEY`
-   - `LIVEKIT_API_SECRET`
-   - `LIVEKIT_URL` — the `wss://...` URL from step 2
-4. Voice rooms return a clear "Voice chat isn't configured on this server
-   yet." error until all three are set; everything else in the app works
-   fine without them.
-5. On the mobile side, voice chat needs `react-native-webrtc` (a native
-   module), which means **Expo Go can no longer run this app** — you'll
-   need an EAS development build or a bare/prebuilt project. See the
-   "Voice chat" section in the project's top-level `README.md` for the
-   client-side setup.
