@@ -2,7 +2,7 @@
 // Usage: node scripts/create-invite.js [days-valid]
 // The generated code can be given to exactly one new user.
 const crypto = require("crypto");
-const { loadState, saveState } = require("../src/store");
+const { loadState, saveState, flush } = require("../src/store");
 
 const SECRET = process.env.INVITE_SECRET || "change-me-invite-secret";
 const days = Number(process.argv[2] || 30);
@@ -18,6 +18,12 @@ async function main() {
     expiresAt: Date.now() + days * 86400000,
   });
   await saveState(db);
+  // saveState() now debounces its Mongo write (see store.js) so the running
+  // server can coalesce bursts of activity into fewer writes. That's the
+  // wrong behavior for this one-off script, which exits right after --
+  // without an explicit flush, the process could exit before the debounced
+  // write ever reaches Mongo, printing a code that was never actually saved.
+  await flush();
   console.log(`Invitation code: ${code}`);
   console.log(`Valid for ${days} day(s).`);
 }
