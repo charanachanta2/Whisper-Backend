@@ -175,6 +175,7 @@ app.post("/api/upload", auth, uploadJsonLimit, (req, res) => {
       if (buffer.length > MAX_UPLOAD_BYTES) return res.status(400).json({ error: "That file is too large (max 80MB)." });
       const ext = path.extname(fileName || "").slice(0, 10);
       const filename = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
       fs.writeFileSync(path.join(UPLOADS_DIR, filename), buffer);
       return res.json({
         url: `${publicBaseUrl(req)}/uploads/${filename}`,
@@ -183,7 +184,8 @@ app.post("/api/upload", auth, uploadJsonLimit, (req, res) => {
         size: buffer.length,
       });
     } catch (error) {
-      return res.status(500).json({ error: "Upload failed." });
+      console.error("[upload] failed:", error);
+      return res.status(500).json({ error: "Upload failed on the server." });
     }
   }
   upload.single("file")(req, res, (err) => {
