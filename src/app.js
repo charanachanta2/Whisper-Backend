@@ -79,10 +79,19 @@ function publicUser(user) { return { id: user.id, username: user.username, name:
 // author's *current* profile photo -- otherwise updating your avatar would
 // leave every past post showing the old one. This resolves it live from
 // the user record on every read instead of caching it on the post.
-function postForClient(db, post) {
+function postForClient(db, post, viewerId) {
   const author = db.users.find(u => u.id === post.userId);
-  return { ...post, userAvatarUrl: author ? (author.avatarUrl || null) : null };
+  const likes = post.likes || [];
+  const comments = (post.comments || []).map(c => {
+    const cu = db.users.find(u => u.id === c.userId);
+    return { ...c, userName: cu ? cu.name : c.userName, userAvatarUrl: cu ? (cu.avatarUrl || null) : null };
+  });
+  const { likes: _l, comments: _c, ...rest } = post;
+  return { ...rest, userAvatarUrl: author ? (author.avatarUrl || null) : null, likeCount: likes.length, likedByMe: viewerId ? likes.includes(viewerId) : false, commentCount: comments.length, comments };
 }
+// A post is visible to its author and their accepted friends -- likes and
+// comments follow the same rule.
+function canSeePost(db, viewerId, post) { return post.userId === viewerId || connected(db, viewerId, post.userId); }
 // `viewerId` lets us resolve a friendlier name/avatar for 1:1 rooms: instead
 // of the generic "Direct messages" label, the client can show the other
 // person's name.
@@ -305,8 +314,8 @@ app.post("/api/friends/requests", auth, async (req, res, next) => { try { const 
 app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next) => { try { const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending"); if (!request) return res.status(404).json({ error: "Request not found." }); request.status = "accepted"; request.acceptedAt = new Date().toISOString(); const room = getOrCreateDirectRoom(req.db, request.fromUserId, request.toUserId); await saveState(req.db);
   await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [request.fromUserId], build: uid => { const { messages, members, ...lite } = roomForClient(req.db, room, uid); return { kind: "friend_accept", title: "Friend request accepted", body: `${req.user.name} accepted your request`, tag: `friend-${request.id}`, roomId: room.id, room: lite }; } }).catch(console.error);
   res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
-app.get("/api/posts", auth, (req, res) => res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || connected(req.db, req.user.id, p.userId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p)) }));
-app.post("/api/posts", auth, async (req, res, next) => { try { const text = String(req.body?.text || "").trim().slice(0, 2000); const media = req.body?.media || null; if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." }); const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, createdAt: new Date().toISOString() }; req.db.posts.push(post); await saveState(req.db); res.json({ post: postForClient(req.db, post) }); } catch (error) { next(error); } });
+app.get("/api/posts", auth, (req, res) => res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || connected(req.db, req.user.id, p.userId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }));
+app.post("/api/posts", auth, async (req, res, next) => { try { const text = String(req.body?.text || "").trim().slice(0, 2000); const media = req.body?.media || null; if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." }); const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, createdAt: new Date().toISOString() }; req.db.posts.push(post); await saveState(req.db); res.json({ post: postForClient(req.db, post, req.user.id) }); } catch (error) { next(error); } });
 // Edit/delete are restricted to the post's own author -- checked by
 // comparing p.userId to req.user.id before allowing either operation.
 app.put("/api/posts/:postId", auth, async (req, res, next) => {
@@ -319,7 +328,7 @@ app.put("/api/posts/:postId", auth, async (req, res, next) => {
     if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." });
     post.text = text; post.media = media; post.editedAt = new Date().toISOString();
     await saveState(req.db);
-    res.json({ post: postForClient(req.db, post) });
+    res.json({ post: postForClient(req.db, post, req.user.id) });
   } catch (error) { next(error); }
 });
 app.delete("/api/posts/:postId", auth, async (req, res, next) => {
@@ -330,6 +339,54 @@ app.delete("/api/posts/:postId", auth, async (req, res, next) => {
     req.db.posts = req.db.posts.filter(p => p.id !== req.params.postId);
     await saveState(req.db);
     res.json({ ok: true });
+  } catch (error) { next(error); }
+});
+// --- Likes & comments ---
+app.post("/api/posts/:postId/like", auth, async (req, res, next) => {
+  try {
+    const post = req.db.posts.find(p => p.id === req.params.postId);
+    if (!post || !canSeePost(req.db, req.user.id, post)) return res.status(404).json({ error: "Post not found." });
+    post.likes = post.likes || [];
+    const had = post.likes.includes(req.user.id);
+    // Optional body { liked: true|false } makes the call idempotent; otherwise toggle.
+    const want = typeof req.body?.liked === "boolean" ? req.body.liked : !had;
+    if (want && !had) post.likes.push(req.user.id);
+    if (!want && had) post.likes = post.likes.filter(u => u !== req.user.id);
+    await saveState(req.db);
+    if (want && !had && post.userId !== req.user.id) {
+      await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [post.userId], build: () => ({ kind: "post_like", title: "New like", body: `${req.user.name} liked your post`, tag: `like-${post.id}-${req.user.id}` }) }).catch(console.error);
+    }
+    res.json({ post: postForClient(req.db, post, req.user.id) });
+  } catch (error) { next(error); }
+});
+app.post("/api/posts/:postId/comments", auth, async (req, res, next) => {
+  try {
+    const post = req.db.posts.find(p => p.id === req.params.postId);
+    if (!post || !canSeePost(req.db, req.user.id, post)) return res.status(404).json({ error: "Post not found." });
+    const text = String(req.body?.text || "").trim().slice(0, 500);
+    if (!text) return res.status(400).json({ error: "Write a comment first." });
+    post.comments = post.comments || [];
+    const comment = { id: id("cmt_"), userId: req.user.id, userName: req.user.name, text, createdAt: new Date().toISOString() };
+    post.comments.push(comment);
+    await saveState(req.db);
+    // Post owner hears about every comment; earlier commenters are not pinged (keeps it quiet).
+    if (post.userId !== req.user.id) {
+      await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [post.userId], build: () => ({ kind: "post_comment", title: "New comment", body: `${req.user.name}: ${text.slice(0, 100)}`, tag: `comment-${comment.id}` }) }).catch(console.error);
+    }
+    res.json({ post: postForClient(req.db, post, req.user.id) });
+  } catch (error) { next(error); }
+});
+app.delete("/api/posts/:postId/comments/:commentId", auth, async (req, res, next) => {
+  try {
+    const post = req.db.posts.find(p => p.id === req.params.postId);
+    if (!post || !canSeePost(req.db, req.user.id, post)) return res.status(404).json({ error: "Post not found." });
+    const comment = (post.comments || []).find(c => c.id === req.params.commentId);
+    if (!comment) return res.status(404).json({ error: "Comment not found." });
+    // The comment's author or the post's owner may remove it.
+    if (comment.userId !== req.user.id && post.userId !== req.user.id) return res.status(403).json({ error: "You can't delete this comment." });
+    post.comments = post.comments.filter(c => c.id !== comment.id);
+    await saveState(req.db);
+    res.json({ post: postForClient(req.db, post, req.user.id) });
   } catch (error) { next(error); }
 });
 app.get("/api/stories", auth, (req, res) => res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || connected(req.db, req.user.id, s.userId))) }));
