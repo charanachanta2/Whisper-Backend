@@ -63,7 +63,7 @@ app.use(cors({ origin: CLIENT_ORIGIN === "*" ? true : CLIENT_ORIGIN }));
 // first, so leaving that route in this one would reject large uploads
 // before they ever reached the route's own parser.
 app.use((req, res, next) => {
-  if (req.path === "/api/upload") return next();
+  if (req.path === "/api/upload" || req.path === "/api/me/avatar") return next();
   express.json({ limit: "2mb" })(req, res, next);
 });
 app.use("/uploads", express.static(UPLOADS_DIR, { maxAge: "7d" }));
@@ -144,6 +144,36 @@ app.patch("/api/me", auth, async (req, res, next) => {
     await saveState(req.db);
     res.json({ user: publicUser(req.user) });
   } catch (error) { next(error); }
+});
+
+// Profile photo. The app resizes the picture to 512px first and sends it as
+// JSON { fileName, mimeType, data: base64 }. We save it, point the signed-in
+// user's avatarUrl at it, delete their previous photo file, and return { user }.
+app.post("/api/me/avatar", auth, express.json({ limit: "15mb" }), async (req, res, next) => {
+  try {
+    const { fileName, mimeType, data } = req.body || {};
+    if (!data) return res.status(400).json({ error: "No photo received." });
+    const type = mimeType || "image/jpeg";
+    if (!String(type).startsWith("image/")) return res.status(400).json({ error: "Please choose an image." });
+    const buffer = Buffer.from(data, "base64");
+    if (!buffer.length) return res.status(400).json({ error: "No photo received." });
+    if (buffer.length > 10 * 1024 * 1024) return res.status(400).json({ error: "That photo is too large (max 10MB)." });
+    const ext = path.extname(fileName || "").slice(0, 10) || ".jpg";
+    const filename = `avatar-${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    fs.writeFileSync(path.join(UPLOADS_DIR, filename), buffer);
+    const previous = req.user.avatarUrl;
+    req.user.avatarUrl = `${publicBaseUrl(req)}/uploads/${filename}`;
+    await saveState(req.db);
+    // Remove the old photo file (only if it is one of ours).
+    try {
+      if (previous && previous.includes("/uploads/")) fs.unlinkSync(path.join(UPLOADS_DIR, path.basename(previous)));
+    } catch (_) { /* already gone */ }
+    res.json({ user: publicUser(req.user) });
+  } catch (error) {
+    console.error("[avatar] failed:", error);
+    next(error);
+  }
 });
 
 // Uploads a photo, video, or file and returns the URL other members of a
