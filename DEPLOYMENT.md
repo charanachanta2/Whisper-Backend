@@ -1,0 +1,56 @@
+# Backend deployment
+
+## Render — single deployment (only supported setup)
+
+`server/src/index.js` runs the Express REST API and the Socket.IO realtime
+server together on one process/port. Deploy that one service to Render and
+point **both** `EXPO_PUBLIC_API_URL` and `EXPO_PUBLIC_SOCKET_URL` in
+`mobile/.env` at its URL.
+
+This is deliberate: earlier this app was split across a Vercel REST
+deployment and a separate Render Socket.IO deployment. Vercel's serverless
+functions can't hold the persistent connection Socket.IO needs, and running
+two deployments meant `ADMIN_SESSION_SECRET`, `INVITE_SECRET`, and
+`MONGODB_URI` all had to match exactly across two separate dashboards. Any
+drift between them showed up as a login that "succeeds" over REST but then
+gets rejected the instant a chat opens, with the app forced back to the
+sign-in screen — the "session keeps expiring" symptom. Running one Render
+service for everything removes that whole class of bug: there's only ever
+one secret, one invite secret, and one database in play.
+
+### Setup
+
+1. Create a Render **Web Service**, `rootDir: server` (already set in
+   `render.yaml`), build command `npm install`, start command `npm start`.
+2. Set these environment variables in Render's dashboard:
+   - `ADMIN_SESSION_SECRET` — any long random string
+   - `INVITE_SECRET` — any long random string
+   - `MONGODB_URI` — your MongoDB connection string
+   - `MONGODB_DB` — defaults to `music_chat` if unset
+   - `CLIENT_ORIGIN` — `*` is fine to start; lock this down to your app's
+     origin once you're ready for production
+3. Deploy, then confirm `https://YOUR-RENDER-SERVICE.onrender.com/health`
+   returns `{"ok":true,...}`.
+4. In `mobile/.env`, set both:
+   ```
+   EXPO_PUBLIC_API_URL=https://YOUR-RENDER-SERVICE.onrender.com
+   EXPO_PUBLIC_SOCKET_URL=https://YOUR-RENDER-SERVICE.onrender.com
+   ```
+5. Generate invite codes with `npm run invite` from the `server/` folder —
+   it uses the same `.env` locally, so make sure `MONGODB_URI`,
+   `MONGODB_DB`, and `INVITE_SECRET` in your local `server/.env` match what's
+   set on Render (otherwise a code created locally won't validate against
+   the deployed database).
+
+### Render free-tier note
+
+Free Render web services spin down after periods of inactivity and take a
+few seconds to wake back up on the next request — the first login or socket
+connect after idle time may be slow or briefly fail before Render finishes
+starting the instance. That's expected on the free tier, not a bug; a paid
+instance stays warm.
+
+## Notifications
+Set VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY / VAPID_SUBJECT (generate with `npx web-push generate-vapid-keys`) to enable
+OS push for the PWA. Without them the in-app pop-ups still work. Friend-request notifications are now sent before the
+HTTP response so they aren't lost when a serverless function freezes after replying.
