@@ -401,8 +401,47 @@ app.delete("/api/posts/:postId/comments/:commentId", auth, async (req, res, next
     res.json({ post: postForClient(req.db, post, req.user.id) });
   } catch (error) { next(error); }
 });
-app.get("/api/stories", auth, (req, res) => res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || connected(req.db, req.user.id, s.userId))) }));
-app.post("/api/stories", auth, async (req, res, next) => { try { const text = String(req.body?.text || "").trim().slice(0, 500); const media = req.body?.media || null; if (!text && !media) return res.status(400).json({ error: "Add text or a photo." }); const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, createdAt: new Date().toISOString(), expiresAt: Date.now() + 86400000 }; req.db.stories.push(story); await saveState(req.db); res.json({ story }); } catch (error) { next(error); } });
+// --- Stories (disappear 24 hours after posting) ---
+const STORY_TTL_MS = 24 * 3600 * 1000;
+function storyForClient(db, story, viewerId) {
+  const author = db.users.find(u => u.id === story.userId);
+  const viewers = story.viewers || [];
+  const { viewers: _v, ...rest } = story;
+  return { ...rest, userAvatarUrl: author ? (author.avatarUrl || null) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined };
+}
+app.get("/api/stories", auth, (req, res) => res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || connected(req.db, req.user.id, s.userId))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }));
+app.post("/api/stories", auth, async (req, res, next) => {
+  try {
+    const text = String(req.body?.text || "").trim().slice(0, 500);
+    const media = req.body?.media || null;
+    if (!media) return res.status(400).json({ error: "Add a photo or video." });
+    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
+    // Expired stories are removed for good whenever a new one is saved.
+    req.db.stories = req.db.stories.filter(s => s.expiresAt > Date.now());
+    req.db.stories.push(story);
+    await saveState(req.db);
+    res.json({ story: storyForClient(req.db, story, req.user.id) });
+  } catch (error) { next(error); }
+});
+app.post("/api/stories/:storyId/view", auth, async (req, res, next) => {
+  try {
+    const story = req.db.stories.find(s => s.id === req.params.storyId && s.expiresAt > Date.now());
+    if (!story || !(story.userId === req.user.id || connected(req.db, req.user.id, story.userId))) return res.status(404).json({ error: "Story not found." });
+    story.viewers = story.viewers || [];
+    if (story.userId !== req.user.id && !story.viewers.includes(req.user.id)) { story.viewers.push(req.user.id); await saveState(req.db); }
+    res.json({ ok: true });
+  } catch (error) { next(error); }
+});
+app.delete("/api/stories/:storyId", auth, async (req, res, next) => {
+  try {
+    const story = req.db.stories.find(s => s.id === req.params.storyId);
+    if (!story) return res.status(404).json({ error: "Story not found." });
+    if (story.userId !== req.user.id) return res.status(403).json({ error: "You can only delete your own stories." });
+    req.db.stories = req.db.stories.filter(s => s.id !== story.id);
+    await saveState(req.db);
+    res.json({ ok: true });
+  } catch (error) { next(error); }
+});
 
 
 // --- Notification inbox (the in-app bell) ---
