@@ -4,7 +4,8 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
-const { loadState, saveState, avatarsCollection } = require("./store");
+const compression = require("compression");
+const { loadState, saveState, avatarsCollection, findInvite, consumeInvite } = require("./store");
 const { notifyUsers, pushPublicKey, isPushEnabled } = require("./notify");
 const { Binary } = require("mongodb");
 
@@ -57,6 +58,8 @@ if (INVITE_SECRET === "change-me-invite-secret") {
   console.warn("[config] INVITE_SECRET is unset (using an insecure default). Set a real value in production.");
 }
 
+// gzip JSON responses (feeds, rooms, chat history) -- big bandwidth saver.
+app.use(compression());
 app.use(cors({ origin: CLIENT_ORIGIN === "*" ? true : CLIENT_ORIGIN }));
 // /api/upload is deliberately excluded here and given its own, much larger
 // limit further down -- a base64-encoded photo/video body can be well over
@@ -67,11 +70,19 @@ app.use((req, res, next) => {
   if (req.path === "/api/upload" || req.path === "/api/me/avatar") return next();
   express.json({ limit: "2mb" })(req, res, next);
 });
-app.use("/uploads", express.static(UPLOADS_DIR, { maxAge: "7d" }));
+// Filenames are unique and never change, so browsers can cache them hard.
+app.use("/uploads", express.static(UPLOADS_DIR, { maxAge: "7d", immutable: true }));
 
 function id(prefix = "") { return prefix + crypto.randomBytes(12).toString("hex"); }
-function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) { return { salt, hash: crypto.scryptSync(password, salt, 64).toString("hex") }; }
-function verifyPassword(password, user) { return crypto.scryptSync(password, user.salt, 64).toString("hex") === user.passwordHash; }
+// Async scrypt: the Sync version blocks the whole server (every request and
+// socket) for the ~100ms it takes, which adds up fast during busy logins.
+const scrypt = (password, salt) => new Promise((resolve, reject) => crypto.scrypt(password, salt, 64, (err, key) => (err ? reject(err) : resolve(key))));
+async function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) { return { salt, hash: (await scrypt(password, salt)).toString("hex") }; }
+async function verifyPassword(password, user) {
+  const a = await scrypt(password, user.salt);
+  const b = Buffer.from(String(user.passwordHash || ""), "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 function sign(payload) { const body = Buffer.from(JSON.stringify(payload)).toString("base64url"); const sig = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url"); return `${body}.${sig}`; }
 function verify(token) { if (!token) return null; try { const [body, sig] = token.split("."); const expected = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url"); if (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; const data = JSON.parse(Buffer.from(body, "base64url").toString()); return data.exp > Date.now() ? data : null; } catch (_) { return null; } }
 function publicUser(user) { return { id: user.id, username: user.username, name: user.name, bio: user.bio || "", avatarUrl: user.avatarUrl || null }; }
@@ -96,7 +107,7 @@ function canSeePost(db, viewerId, post) { return post.userId === viewerId || con
 // `viewerId` lets us resolve a friendlier name/avatar for 1:1 rooms: instead
 // of the generic "Direct messages" label, the client can show the other
 // person's name.
-function roomForClient(db, room, viewerId) {
+function roomForClient(db, room, viewerId, { withMessages = true } = {}) {
   const isDirect = Boolean(room.directKey);
   const otherUserId = isDirect ? room.members.find(uid => uid !== viewerId) : null;
   const otherUser = otherUserId ? db.users.find(u => u.id === otherUserId) : null;
@@ -108,8 +119,15 @@ function roomForClient(db, room, viewerId) {
     otherUser: otherUser ? publicUser(otherUser) : null,
     memberCount: room.members.length,
     members: room.members.map(uid => db.users.find(u => u.id === uid)).filter(Boolean).map(publicUser),
-    messages: db.messages.filter(m => m.roomId === room.id).slice(-200),
+    messages: withMessages ? lastMessagesFor(db, room.id, 200) : [],
   };
+}
+// Walks the message list backwards and stops as soon as it has `n` messages
+// for the room, instead of filtering all (up to 5000) messages every time.
+function lastMessagesFor(db, roomId, n) {
+  const out = [];
+  for (let i = db.messages.length - 1; i >= 0 && out.length < n; i--) if (db.messages[i].roomId === roomId) out.push(db.messages[i]);
+  return out.reverse();
 }
 // Shared by the friend-request-accept flow and the "message this friend"
 // flow so both always resolve to the same 1:1 room instead of creating
@@ -213,7 +231,7 @@ app.post("/api/me/avatar", auth, express.json({ limit: "15mb" }), async (req, re
 // middleware below) rather than raised globally, since a base64 video can
 // be ~1.4x its raw byte size.
 const uploadJsonLimit = express.json({ limit: "110mb" });
-app.post("/api/upload", auth, uploadJsonLimit, (req, res) => {
+app.post("/api/upload", auth, uploadJsonLimit, async (req, res) => {
   const contentType = req.headers["content-type"] || "";
   if (contentType.startsWith("application/json")) {
     try {
@@ -226,8 +244,9 @@ app.post("/api/upload", auth, uploadJsonLimit, (req, res) => {
       if (buffer.length > MAX_UPLOAD_BYTES) return res.status(400).json({ error: "That file is too large (max 80MB)." });
       const ext = path.extname(fileName || "").slice(0, 10);
       const filename = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
-      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-      fs.writeFileSync(path.join(UPLOADS_DIR, filename), buffer);
+      // Async write: writeFileSync would freeze the whole server while a large video is saved.
+      await fs.promises.mkdir(UPLOADS_DIR, { recursive: true });
+      await fs.promises.writeFile(path.join(UPLOADS_DIR, filename), buffer);
       return res.json({
         url: `${publicBaseUrl(req)}/uploads/${filename}`,
         mimeType: type,
@@ -260,26 +279,31 @@ app.post("/api/auth/register", async (req, res, next) => {
     const normalized = String(username).trim().toLowerCase();
     if (db.users.some(u => u.username === normalized)) return res.status(409).json({ error: "Username already exists." });
     const inviteHash = crypto.createHmac("sha256", INVITE_SECRET).update(String(inviteCode).trim()).digest("hex");
-    const invite = db.invites.find(i => i.hash === inviteHash && !i.used && (!i.expiresAt || i.expiresAt > Date.now()));
-    if (!invite) return res.status(403).json({ error: "Invalid or already used invitation." });
-    const pass = hashPassword(String(password));
+    // Invites are checked and claimed directly in MongoDB (atomically), so a code made with `npm run invite` works immediately and can't be used twice.
+    if (!(await findInvite(inviteHash))) return res.status(403).json({ error: "Invalid or already used invitation." });
+    const pass = await hashPassword(String(password));
     const user = { id: id("usr_"), username: normalized, name: String(name || username).trim(), bio: "", avatarUrl: null, salt: pass.salt, passwordHash: pass.hash, active: true, createdAt: new Date().toISOString() };
-    db.users.push(user); invite.used = true; invite.usedBy = user.id; invite.usedAt = Date.now();
+    if (!(await consumeInvite(inviteHash, user.id))) return res.status(403).json({ error: "Invalid or already used invitation." });
+    if (db.users.some(u => u.username === normalized)) return res.status(409).json({ error: "Username already exists." });
+    db.users.push(user);
     await saveState(db);
     res.json({ token: sign({ userId: user.id, exp: Date.now() + 1000 * 60 * 60 * 24 * 30 }), user: publicUser(user) });
   } catch (error) { next(error); }
 });
 
-app.post("/api/auth/login", async (req, res, next) => { try { const db = await loadState(); const normalized = String(req.body?.username || "").trim().toLowerCase(); const user = db.users.find(u => u.username === normalized); if (!user || !verifyPassword(String(req.body?.password || ""), user)) return res.status(401).json({ error: "Invalid username or password." }); res.json({ token: sign({ userId: user.id, exp: Date.now() + 1000 * 60 * 60 * 24 * 30 }), user: publicUser(user) }); } catch (error) { next(error); } });
-app.get("/api/rooms", auth, (req, res) => res.json({
+app.post("/api/auth/login", async (req, res, next) => { try { const db = await loadState(); const normalized = String(req.body?.username || "").trim().toLowerCase(); const user = db.users.find(u => u.username === normalized); if (!user || !(await verifyPassword(String(req.body?.password || ""), user))) return res.status(401).json({ error: "Invalid username or password." }); res.json({ token: sign({ userId: user.id, exp: Date.now() + 1000 * 60 * 60 * 24 * 30 }), user: publicUser(user) }); } catch (error) { next(error); } });
+app.get("/api/rooms", auth, (req, res) => {
+  // One pass over the messages to find each room's latest one (was: filter all messages once per room).
+  const lastByRoom = new Map();
+  for (const m of req.db.messages) lastByRoom.set(m.roomId, m);
+  res.json({
   rooms: req.db.rooms
     .filter(r => r.members.includes(req.user.id))
     .map(r => {
       const isDirect = Boolean(r.directKey);
       const otherUserId = isDirect ? r.members.find(uid => uid !== req.user.id) : null;
       const otherUser = otherUserId ? req.db.users.find(u => u.id === otherUserId) : null;
-      const roomMessages = req.db.messages.filter(m => m.roomId === r.id);
-      const lastMessage = roomMessages[roomMessages.length - 1] || null;
+      const lastMessage = lastByRoom.get(r.id) || null;
       return {
         id: r.id,
         name: isDirect && otherUser ? otherUser.name : r.name,
@@ -291,11 +315,18 @@ app.get("/api/rooms", auth, (req, res) => res.json({
       };
     })
     .sort((a, b) => (b.lastMessage?.createdAt || "").localeCompare(a.lastMessage?.createdAt || "")),
-}));
+  });
+});
 app.post("/api/rooms", auth, async (req, res, next) => { try { const isVoice = Boolean(req.body?.isVoice); const room = { id: id("room_"), name: String(req.body?.name || (isVoice ? "Voice room" : "Private chat")).trim().slice(0, 80), members: [req.user.id], isVoice, createdAt: new Date().toISOString() }; req.db.rooms.push(room); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 app.post("/api/rooms/:roomId/invite", auth, async (req, res, next) => { try { const room = req.db.rooms.find(r => r.id === req.params.roomId); if (!room || !room.members.includes(req.user.id)) return res.status(403).json({ error: "Not a member." }); if (room.directKey) return res.status(400).json({ error: "Direct messages can't have people added. Start a room instead." }); const target = req.db.users.find(u => u.username === String(req.body?.username || "").trim().toLowerCase()); if (!target) return res.status(404).json({ error: "User not found." }); if (!room.members.includes(target.id)) room.members.push(target.id); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 
 function connected(db, firstId, secondId) { return db.friendRequests.some(r => r.status === "accepted" && ((r.fromUserId === firstId && r.toUserId === secondId) || (r.fromUserId === secondId && r.toUserId === firstId))); }
+// All of a person's accepted friends as a Set, built once per request (connected() rescans every friend request on each call).
+function friendIds(db, userId) {
+  const set = new Set();
+  for (const r of db.friendRequests) if (r.status === "accepted") { if (r.fromUserId === userId) set.add(r.toUserId); else if (r.toUserId === userId) set.add(r.fromUserId); }
+  return set;
+}
 function socialUser(user) { return { id: user.id, username: user.username, name: user.name }; }
 
 // Opens (or creates) the 1:1 chat with an existing friend. This is what
@@ -324,9 +355,9 @@ app.post("/api/friends/requests", auth, async (req, res, next) => { try { const 
   await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [target.id], build: () => ({ kind: "friend_request", title: "New friend request", body: `${req.user.name} wants to connect with you`, tag: `friend-${request.id}` }) }).catch(console.error);
   res.json({ request }); } catch (error) { next(error); } });
 app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next) => { try { const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending"); if (!request) return res.status(404).json({ error: "Request not found." }); request.status = "accepted"; request.acceptedAt = new Date().toISOString(); const room = getOrCreateDirectRoom(req.db, request.fromUserId, request.toUserId); await saveState(req.db);
-  await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [request.fromUserId], build: uid => { const { messages, members, ...lite } = roomForClient(req.db, room, uid); return { kind: "friend_accept", title: "Friend request accepted", body: `${req.user.name} accepted your request`, tag: `friend-${request.id}`, roomId: room.id, room: lite }; } }).catch(console.error);
+  await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [request.fromUserId], build: uid => { const { messages, members, ...lite } = roomForClient(req.db, room, uid, { withMessages: false }); return { kind: "friend_accept", title: "Friend request accepted", body: `${req.user.name} accepted your request`, tag: `friend-${request.id}`, roomId: room.id, room: lite }; } }).catch(console.error);
   res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
-app.get("/api/posts", auth, (req, res) => res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || connected(req.db, req.user.id, p.userId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }));
+app.get("/api/posts", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || friends.has(p.userId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }); });
 app.post("/api/posts", auth, async (req, res, next) => {
   try {
     const text = String(req.body?.text || "").trim().slice(0, 2000);
@@ -488,7 +519,7 @@ function storyForClient(db, story, viewerId) {
   const { viewers: _v, ...rest } = story;
   return { ...rest, userAvatarUrl: author ? (author.avatarUrl || null) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined };
 }
-app.get("/api/stories", auth, (req, res) => res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || connected(req.db, req.user.id, s.userId))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }));
+app.get("/api/stories", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || friends.has(s.userId))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }); });
 app.post("/api/stories", auth, async (req, res, next) => {
   try {
     const text = String(req.body?.text || "").trim().slice(0, 500);

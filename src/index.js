@@ -1,13 +1,16 @@
 const http = require("http");
 const { Server } = require("socket.io");
 const crypto = require("crypto");
+const { enableCache, flushNow } = require("./store");
+// Long-running server: keep app state in memory and write it to MongoDB in batches.
+enableCache();
 const { app, helpers } = require("./app");
 const { notifyUsers, previewFor } = require("./notify");
 
 const PORT = process.env.PORT || 3000;
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN } });
+const io = new Server(server, { serveClient: false, cors: { origin: CLIENT_ORIGIN === "*" ? "*" : CLIENT_ORIGIN } });
 app.locals.io = io;
 const id = (prefix = "") => prefix + crypto.randomBytes(12).toString("hex");
 const inRoom = (room, userId) => room && room.members.includes(userId);
@@ -52,12 +55,11 @@ io.on("connection", socket => {
     const state = helpers.roomForClient(db, room, socket.user.id);
     socket.emit("room_state", state); io.to(roomId).emit("members_changed", state.members);
     // Opening a chat counts as reading its notification.
-    if ((db.notifications || []).some(n => n.userId === socket.user.id && n.roomId === roomId && !n.read)) {
-      try {
-        const fresh = await helpers.loadState();
-        for (const n of fresh.notifications || []) if (n.userId === socket.user.id && n.roomId === roomId) n.read = true;
-        await helpers.saveState(fresh);
-      } catch (error) { console.error("[notify] mark read failed:", error.message); }
+    let marked = false;
+    for (const n of db.notifications || []) if (n.userId === socket.user.id && n.roomId === roomId && !n.read) { n.read = true; marked = true; }
+    if (marked) {
+      try { await helpers.saveState(db); }
+      catch (error) { console.error("[notify] mark read failed:", error.message); }
     }
   });
   socket.on("leave_room", ({ roomId }) => {
@@ -85,7 +87,7 @@ io.on("connection", socket => {
         const isDirect = Boolean(room.directKey);
         const preview = previewFor(message);
         notifyUsers({ io, db, userIds: recipients, build: uid => {
-          const { messages, members, ...lite } = helpers.roomForClient(db, room, uid);
+          const { messages, members, ...lite } = helpers.roomForClient(db, room, uid, { withMessages: false });
           return { kind: "message", roomId, room: lite, title: isDirect ? socket.user.name : (room.name || "New message"), body: isDirect ? preview : `${socket.user.name}: ${preview}`, tag: `room-${roomId}` };
         } }).catch(error => console.error("[notify]", error.message));
       }
@@ -138,5 +140,15 @@ io.on("connection", socket => {
     io.to(`voice:${roomId}`).emit("voice_participants", voiceState(roomId));
   });
 });
+
+// Write any batched changes to MongoDB before the process exits (deploys/restarts).
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return; shuttingDown = true;
+  try { await flushNow(); } catch (error) { console.error("[shutdown] flush failed:", error.message); }
+  process.exit(0);
+}
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 server.listen(PORT, "0.0.0.0", () => console.log(`Music Chat backend listening on ${PORT}`));

@@ -42,13 +42,15 @@ const MAX_PER_USER = 200;
 const MAX_AGE_MS = 60 * 24 * 3600 * 1000;
 function newId() { return "ntf_" + require("crypto").randomBytes(10).toString("hex"); }
 
+let lastAgePrune = 0;
 async function storeNotifications(entries) {
   const fresh = await loadState();
   fresh.notifications = fresh.notifications || [];
   const now = new Date().toISOString();
-  const cutoff = Date.now() - MAX_AGE_MS;
+  const touched = new Set();
   for (const { userId, payload } of entries) {
     const { room, ...data } = payload;
+    touched.add(userId);
     const existing = data.tag ? fresh.notifications.find(x => x.userId === userId && x.tag === data.tag) : null;
     if (existing) {
       Object.assign(existing, data, { read: false, createdAt: now });
@@ -59,15 +61,24 @@ async function storeNotifications(entries) {
       payload.notificationId = entry.id;
     }
   }
-  // Trim old rows and cap each person's history.
-  const perUser = new Map();
-  fresh.notifications.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  fresh.notifications = fresh.notifications.filter(x => {
-    if (new Date(x.createdAt).getTime() < cutoff) return false;
-    const c = (perUser.get(x.userId) || 0) + 1;
-    perUser.set(x.userId, c);
-    return c <= MAX_PER_USER;
-  });
+  // Cap history only for the people who just got a notification (instead of
+  // sorting everyone's notifications every time), and sweep old rows hourly.
+  const sweepAge = Date.now() - lastAgePrune > 3600 * 1000;
+  if (sweepAge) lastAgePrune = Date.now();
+  const cutoff = Date.now() - MAX_AGE_MS;
+  const counts = new Map();
+  let overCap = false;
+  for (const x of fresh.notifications) if (touched.has(x.userId)) { const c = (counts.get(x.userId) || 0) + 1; counts.set(x.userId, c); if (c > MAX_PER_USER) overCap = true; }
+  if (overCap || sweepAge) {
+    fresh.notifications.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const perUser = new Map();
+    fresh.notifications = fresh.notifications.filter(x => {
+      if (new Date(x.createdAt).getTime() < cutoff) return false;
+      const c = (perUser.get(x.userId) || 0) + 1;
+      perUser.set(x.userId, c);
+      return c <= MAX_PER_USER;
+    });
+  }
   await saveState(fresh);
 }
 
