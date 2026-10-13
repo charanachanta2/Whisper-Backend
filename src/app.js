@@ -4,8 +4,9 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
-const { loadState, saveState } = require("./store");
+const { loadState, saveState, avatarsCollection } = require("./store");
 const { notifyUsers, pushPublicKey, isPushEnabled } = require("./notify");
+const { Binary } = require("mongodb");
 
 const app = express();
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
@@ -137,6 +138,17 @@ async function auth(req, res, next) {
   } catch (error) { next(error); }
 }
 
+// Public (an <img> can't send an auth header). The ?v= in avatarUrl changes
+// with every upload, so a long cache lifetime is safe.
+app.get("/avatars/:userId", async (req, res, next) => {
+  try {
+    const doc = await (await avatarsCollection()).findOne({ _id: String(req.params.userId) });
+    if (!doc || !doc.data) return res.status(404).end();
+    res.set("Content-Type", doc.mime || "image/jpeg");
+    res.set("Cache-Control", "public, max-age=604800, immutable");
+    res.send(Buffer.from(doc.data.buffer));
+  } catch (error) { next(error); }
+});
 app.get("/", (req, res) => res.json({ service: "music-chat-api", status: "online" }));
 app.get("/health", async (req, res, next) => { try { await loadState(); res.json({ ok: true, service: "music-chat-server", storage: "mongodb" }); } catch (error) { next(error); } });
 app.get("/api/me", auth, (req, res) => res.json({ user: publicUser(req.user) }));
@@ -167,17 +179,17 @@ app.post("/api/me/avatar", auth, express.json({ limit: "15mb" }), async (req, re
     const buffer = Buffer.from(data, "base64");
     if (!buffer.length) return res.status(400).json({ error: "No photo received." });
     if (buffer.length > 10 * 1024 * 1024) return res.status(400).json({ error: "That photo is too large (max 10MB)." });
-    const ext = path.extname(fileName || "").slice(0, 10) || ".jpg";
-    const filename = `avatar-${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
-    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-    fs.writeFileSync(path.join(UPLOADS_DIR, filename), buffer);
-    const previous = req.user.avatarUrl;
-    req.user.avatarUrl = `${publicBaseUrl(req)}/uploads/${filename}`;
+    // Saved in MongoDB, NOT on the server's disk: the disk is wiped on every
+    // redeploy/restart (Render, Vercel), which used to leave avatarUrl
+    // pointing at a file that no longer existed -- a blank profile photo.
+    const updatedAt = Date.now();
+    await (await avatarsCollection()).replaceOne(
+      { _id: req.user.id },
+      { _id: req.user.id, mime: String(type), data: new Binary(buffer), updatedAt },
+      { upsert: true },
+    );
+    req.user.avatarUrl = `${publicBaseUrl(req)}/avatars/${req.user.id}?v=${updatedAt}`;
     await saveState(req.db);
-    // Remove the old photo file (only if it is one of ours).
-    try {
-      if (previous && previous.includes("/uploads/")) fs.unlinkSync(path.join(UPLOADS_DIR, path.basename(previous)));
-    } catch (_) { /* already gone */ }
     res.json({ user: publicUser(req.user) });
   } catch (error) {
     console.error("[avatar] failed:", error);

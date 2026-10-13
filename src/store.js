@@ -21,6 +21,19 @@ async function collection() {
   return client.db(process.env.MONGODB_DB || "music_chat").collection("app_state");
 }
 
+// Profile photos live in their own collection (not inside the big shared
+// "state" document) so they survive redeploys and don't bloat every read.
+async function avatarsCollection() {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) throw new Error("MONGODB_URI is not configured.");
+  if (!clientPromise) {
+    const client = new MongoClient(uri);
+    clientPromise = client.connect();
+  }
+  const client = await clientPromise;
+  return client.db(process.env.MONGODB_DB || "music_chat").collection("avatars");
+}
+
 async function loadState() {
   const document = await (await collection()).findOne({ _id: "state" });
   if (!document) return emptyState();
@@ -36,4 +49,4 @@ async function saveState(state) {
   );
 }
 
-module.exports = { emptyState, loadState, saveState };
+module.exports = { avatarsCollection, emptyState, loadState, saveState };
