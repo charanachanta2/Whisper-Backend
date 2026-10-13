@@ -98,12 +98,29 @@ function postForClient(db, post, viewerId) {
     const cu = db.users.find(u => u.id === c.userId);
     return { ...c, userName: cu ? cu.name : c.userName, userAvatarUrl: cu ? (cu.avatarUrl || null) : null };
   });
-  const { likes: _l, comments: _c, ...rest } = post;
-  return { ...rest, userAvatarUrl: author ? (author.avatarUrl || null) : null, likeCount: likes.length, likedByMe: viewerId ? likes.includes(viewerId) : false, commentCount: comments.length, comments };
+  const { likes: _l, comments: _c, audience, ...rest } = post;
+  // Only the author is told who a post is limited to.
+  const audienceInfo = viewerId && post.userId === viewerId ? { audience: Array.isArray(audience) ? audience : null, audienceCount: Array.isArray(audience) ? audience.length : null } : {};
+  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, likeCount: likes.length, likedByMe: viewerId ? likes.includes(viewerId) : false, commentCount: comments.length, comments };
 }
 // A post is visible to its author and their accepted friends -- likes and
 // comments follow the same rule.
-function canSeePost(db, viewerId, post) { return post.userId === viewerId || connected(db, viewerId, post.userId); }
+// A post/story can optionally be limited to chosen friends (`audience` = list of user ids; null/absent = all friends).
+function canViewItem(db, viewerId, item) {
+  if (item.userId === viewerId) return true;
+  if (!connected(db, viewerId, item.userId)) return false;
+  return !Array.isArray(item.audience) || item.audience.includes(viewerId);
+}
+function canSeePost(db, viewerId, post) { return canViewItem(db, viewerId, post); }
+// Reads the requested audience from a request body. undefined/null -> all friends (null). A list is cut down to the author's actual friends.
+function readAudience(db, userId, raw) {
+  if (raw === undefined || raw === null) return { audience: null };
+  if (!Array.isArray(raw)) return { error: "Invalid audience." };
+  const friends = friendIds(db, userId);
+  const audience = [...new Set(raw.map(String))].filter(i => friends.has(i)).slice(0, 500);
+  if (!audience.length) return { error: "Choose at least one person who can see this." };
+  return { audience };
+}
 // `viewerId` lets us resolve a friendlier name/avatar for 1:1 rooms: instead
 // of the generic "Direct messages" label, the client can show the other
 // person's name.
@@ -343,6 +360,11 @@ app.post("/api/dm/:userId", auth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+// The signed-in person's friends -- used to pick who can see a post or story.
+app.get("/api/friends", auth, (req, res) => {
+  const ids = friendIds(req.db, req.user.id);
+  res.json({ friends: req.db.users.filter(u => ids.has(u.id) && u.active !== false).map(u => ({ ...socialUser(u), avatarUrl: u.avatarUrl || null })).sort((a, b) => a.name.localeCompare(b.name)) });
+});
 app.get("/api/users/search", auth, (req, res) => {
   const query = String(req.query.q || "").trim().toLowerCase();
   if (!query) return res.json({ users: [] });
@@ -357,14 +379,16 @@ app.post("/api/friends/requests", auth, async (req, res, next) => { try { const 
 app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next) => { try { const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending"); if (!request) return res.status(404).json({ error: "Request not found." }); request.status = "accepted"; request.acceptedAt = new Date().toISOString(); const room = getOrCreateDirectRoom(req.db, request.fromUserId, request.toUserId); await saveState(req.db);
   await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [request.fromUserId], build: uid => { const { messages, members, ...lite } = roomForClient(req.db, room, uid, { withMessages: false }); return { kind: "friend_accept", title: "Friend request accepted", body: `${req.user.name} accepted your request`, tag: `friend-${request.id}`, roomId: room.id, room: lite }; } }).catch(console.error);
   res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
-app.get("/api/posts", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || friends.has(p.userId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }); });
+app.get("/api/posts", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || (friends.has(p.userId) && (!Array.isArray(p.audience) || p.audience.includes(req.user.id)))).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }); });
 app.post("/api/posts", auth, async (req, res, next) => {
   try {
     const text = String(req.body?.text || "").trim().slice(0, 2000);
     const media = req.body?.media || null;
     if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." });
     if (videoTooLong(media, req.body?.duration)) return res.status(400).json({ error: `Videos can be up to ${MAX_VIDEO_SEC} seconds.` });
-    const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, duration: media ? cleanDuration("post", media, req.body?.duration) : null, music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), createdAt: new Date().toISOString() };
+    const aud = readAudience(req.db, req.user.id, req.body?.audience);
+    if (aud.error) return res.status(400).json({ error: aud.error });
+    const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, audience: aud.audience, duration: media ? cleanDuration("post", media, req.body?.duration) : null, music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), createdAt: new Date().toISOString() };
     req.db.posts.push(post);
     await saveState(req.db);
     res.json({ post: postForClient(req.db, post, req.user.id) });
@@ -380,6 +404,11 @@ app.put("/api/posts/:postId", auth, async (req, res, next) => {
     const text = String(req.body?.text ?? post.text).trim().slice(0, 2000);
     const media = req.body?.media !== undefined ? req.body.media : post.media;
     if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." });
+    if (req.body?.audience !== undefined) {
+      const aud = readAudience(req.db, req.user.id, req.body.audience);
+      if (aud.error) return res.status(400).json({ error: aud.error });
+      post.audience = aud.audience;
+    }
     post.text = text; post.media = media; post.editedAt = new Date().toISOString();
     await saveState(req.db);
     res.json({ post: postForClient(req.db, post, req.user.id) });
@@ -517,16 +546,19 @@ function storyForClient(db, story, viewerId) {
   const author = db.users.find(u => u.id === story.userId);
   const viewers = story.viewers || [];
   const { viewers: _v, ...rest } = story;
-  return { ...rest, userAvatarUrl: author ? (author.avatarUrl || null) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined };
+  const audienceInfo = viewerId && story.userId === viewerId ? { audience: Array.isArray(story.audience) ? story.audience : null, audienceCount: Array.isArray(story.audience) ? story.audience.length : null } : { audience: undefined };
+  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined };
 }
-app.get("/api/stories", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || friends.has(s.userId))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }); });
+app.get("/api/stories", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || (friends.has(s.userId) && (!Array.isArray(s.audience) || s.audience.includes(req.user.id))))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }); });
 app.post("/api/stories", auth, async (req, res, next) => {
   try {
     const text = String(req.body?.text || "").trim().slice(0, 500);
     const media = req.body?.media || null;
     if (!media) return res.status(400).json({ error: "Add a photo or video." });
     if (videoTooLong(media, req.body?.duration)) return res.status(400).json({ error: `Videos can be up to ${MAX_VIDEO_SEC} seconds.` });
-    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, duration: cleanDuration("story", media, req.body?.duration), music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
+    const aud = readAudience(req.db, req.user.id, req.body?.audience);
+    if (aud.error) return res.status(400).json({ error: aud.error });
+    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, audience: aud.audience, duration: cleanDuration("story", media, req.body?.duration), music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
     // Expired stories are removed for good whenever a new one is saved.
     req.db.stories = req.db.stories.filter(s => s.expiresAt > Date.now());
     req.db.stories.push(story);
@@ -537,7 +569,7 @@ app.post("/api/stories", auth, async (req, res, next) => {
 app.post("/api/stories/:storyId/view", auth, async (req, res, next) => {
   try {
     const story = req.db.stories.find(s => s.id === req.params.storyId && s.expiresAt > Date.now());
-    if (!story || !(story.userId === req.user.id || connected(req.db, req.user.id, story.userId))) return res.status(404).json({ error: "Story not found." });
+    if (!story || !canViewItem(req.db, req.user.id, story)) return res.status(404).json({ error: "Story not found." });
     story.viewers = story.viewers || [];
     if (story.userId !== req.user.id && !story.viewers.includes(req.user.id)) { story.viewers.push(req.user.id); await saveState(req.db); }
     res.json({ ok: true });
