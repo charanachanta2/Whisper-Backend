@@ -327,7 +327,7 @@ app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next)
   await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [request.fromUserId], build: uid => { const { messages, members, ...lite } = roomForClient(req.db, room, uid); return { kind: "friend_accept", title: "Friend request accepted", body: `${req.user.name} accepted your request`, tag: `friend-${request.id}`, roomId: room.id, room: lite }; } }).catch(console.error);
   res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 app.get("/api/posts", auth, (req, res) => res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || connected(req.db, req.user.id, p.userId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }));
-app.post("/api/posts", auth, async (req, res, next) => { try { const text = String(req.body?.text || "").trim().slice(0, 2000); const media = req.body?.media || null; if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." }); const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, createdAt: new Date().toISOString() }; req.db.posts.push(post); await saveState(req.db); res.json({ post: postForClient(req.db, post, req.user.id) }); } catch (error) { next(error); } });
+app.post("/api/posts", auth, async (req, res, next) => { try { const text = String(req.body?.text || "").trim().slice(0, 2000); const media = req.body?.media || null; if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." }); const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), createdAt: new Date().toISOString() }; req.db.posts.push(post); await saveState(req.db); res.json({ post: postForClient(req.db, post, req.user.id) }); } catch (error) { next(error); } });
 // Edit/delete are restricted to the post's own author -- checked by
 // comparing p.userId to req.user.id before allowing either operation.
 app.put("/api/posts/:postId", auth, async (req, res, next) => {
@@ -353,6 +353,53 @@ app.delete("/api/posts/:postId", auth, async (req, res, next) => {
     res.json({ ok: true });
   } catch (error) { next(error); }
 });
+// --- Music + text overlays attached to posts and stories ---
+// Music is a 30-second preview clip chosen from Apple's public iTunes Search
+// catalogue (no account/key needed). Only the metadata and the preview URL
+// are stored; the audio itself stays on Apple's servers.
+function cleanMusic(m) {
+  if (!m || typeof m !== "object") return null;
+  const previewUrl = String(m.previewUrl || "");
+  let host = "";
+  try { host = new URL(previewUrl).hostname; } catch (_) { return null; }
+  if (!/^https:/.test(previewUrl) || !(host.endsWith(".mzstatic.com") || host.endsWith(".apple.com"))) return null;
+  const artwork = String(m.artworkUrl || "");
+  return { trackId: String(m.trackId || "").slice(0, 40), title: String(m.title || "Unknown song").slice(0, 120), artist: String(m.artist || "").slice(0, 120), artworkUrl: /^https:\/\//.test(artwork) ? artwork.slice(0, 500) : null, previewUrl: previewUrl.slice(0, 500) };
+}
+// Text stickers placed on a photo/video. x/y/scale are relative so they look
+// the same at any screen size.
+function cleanOverlays(list) {
+  if (!Array.isArray(list)) return [];
+  const num = (v, lo, hi, d) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
+  return list.slice(0, 12).map(o => ({
+    id: String(o?.id || id("t_")).slice(0, 40),
+    text: String(o?.text || "").slice(0, 200),
+    color: /^#[0-9a-fA-F]{6}$/.test(String(o?.color || "")) ? o.color : "#FFFFFF",
+    style: o?.style === "box" ? "box" : "plain",
+    x: num(o?.x, 0, 1, 0.5), y: num(o?.y, 0, 1, 0.5), scale: num(o?.scale, 0.4, 4, 1),
+  })).filter(o => o.text.trim());
+}
+
+app.get("/api/music/search", auth, async (req, res) => {
+  const q = String(req.query.q || "").trim().slice(0, 100);
+  if (!q) return res.json({ results: [] });
+  try {
+    const url = `https://itunes.apple.com/search?media=music&entity=song&limit=25&term=${encodeURIComponent(q)}`;
+    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!r.ok) throw new Error(`iTunes ${r.status}`);
+    const data = await r.json();
+    const results = (data.results || []).filter(t => t.previewUrl).map(t => ({
+      trackId: String(t.trackId), title: t.trackName, artist: t.artistName,
+      artworkUrl: t.artworkUrl100 ? t.artworkUrl100.replace("100x100", "300x300") : null,
+      previewUrl: t.previewUrl,
+    }));
+    res.json({ results });
+  } catch (error) {
+    console.error("[music] search failed:", error.message);
+    res.status(502).json({ error: "Music search is unavailable right now. Please try again." });
+  }
+});
+
 // --- Likes & comments ---
 app.post("/api/posts/:postId/like", auth, async (req, res, next) => {
   try {
@@ -415,7 +462,7 @@ app.post("/api/stories", auth, async (req, res, next) => {
     const text = String(req.body?.text || "").trim().slice(0, 500);
     const media = req.body?.media || null;
     if (!media) return res.status(400).json({ error: "Add a photo or video." });
-    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
+    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
     // Expired stories are removed for good whenever a new one is saved.
     req.db.stories = req.db.stories.filter(s => s.expiresAt > Date.now());
     req.db.stories.push(story);
