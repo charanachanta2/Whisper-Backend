@@ -327,7 +327,18 @@ app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next)
   await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [request.fromUserId], build: uid => { const { messages, members, ...lite } = roomForClient(req.db, room, uid); return { kind: "friend_accept", title: "Friend request accepted", body: `${req.user.name} accepted your request`, tag: `friend-${request.id}`, roomId: room.id, room: lite }; } }).catch(console.error);
   res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 app.get("/api/posts", auth, (req, res) => res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || connected(req.db, req.user.id, p.userId)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }));
-app.post("/api/posts", auth, async (req, res, next) => { try { const text = String(req.body?.text || "").trim().slice(0, 2000); const media = req.body?.media || null; if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." }); const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), createdAt: new Date().toISOString() }; req.db.posts.push(post); await saveState(req.db); res.json({ post: postForClient(req.db, post, req.user.id) }); } catch (error) { next(error); } });
+app.post("/api/posts", auth, async (req, res, next) => {
+  try {
+    const text = String(req.body?.text || "").trim().slice(0, 2000);
+    const media = req.body?.media || null;
+    if (!text && !media) return res.status(400).json({ error: "Write something or attach a photo." });
+    if (videoTooLong(media, req.body?.duration)) return res.status(400).json({ error: `Videos can be up to ${MAX_VIDEO_SEC} seconds.` });
+    const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, duration: media ? cleanDuration("post", media, req.body?.duration) : null, music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), createdAt: new Date().toISOString() };
+    req.db.posts.push(post);
+    await saveState(req.db);
+    res.json({ post: postForClient(req.db, post, req.user.id) });
+  } catch (error) { next(error); }
+});
 // Edit/delete are restricted to the post's own author -- checked by
 // comparing p.userId to req.user.id before allowing either operation.
 app.put("/api/posts/:postId", auth, async (req, res, next) => {
@@ -353,6 +364,22 @@ app.delete("/api/posts/:postId", auth, async (req, res, next) => {
     res.json({ ok: true });
   } catch (error) { next(error); }
 });
+// --- How long a post / story plays ---
+// Photo posts: 15-30s.  Photo stories: up to 15s.  Videos (post or story): up to 60s.
+// The picker in the app enforces this too, but the server is the real gate.
+const MAX_VIDEO_SEC = 60;
+const PHOTO_LIMITS = { post: { min: 15, max: 30, def: 15 }, story: { min: 3, max: 15, def: 5 } };
+const CLIP_SEC = 30; // iTunes previews are 30 seconds long
+const MIN_MUSIC_WINDOW_SEC = 5;
+function isVideoMedia(media) { return String(media?.mimeType || "").startsWith("video/"); }
+// A video longer than the cap (1s of slack for rounding) is rejected outright.
+function videoTooLong(media, raw) { const n = Number(raw); return isVideoMedia(media) && Number.isFinite(n) && n > MAX_VIDEO_SEC + 1; }
+function cleanDuration(kind, media, raw) {
+  const n = Number(raw);
+  if (isVideoMedia(media)) return Number.isFinite(n) && n > 0 ? Math.min(MAX_VIDEO_SEC, Math.round(n)) : MAX_VIDEO_SEC;
+  const lim = PHOTO_LIMITS[kind];
+  return Number.isFinite(n) ? Math.min(lim.max, Math.max(lim.min, Math.round(n))) : lim.def;
+}
 // --- Music + text overlays attached to posts and stories ---
 // Music is a 30-second preview clip chosen from Apple's public iTunes Search
 // catalogue (no account/key needed). Only the metadata and the preview URL
@@ -364,7 +391,12 @@ function cleanMusic(m) {
   try { host = new URL(previewUrl).hostname; } catch (_) { return null; }
   if (!/^https:/.test(previewUrl) || !(host.endsWith(".mzstatic.com") || host.endsWith(".apple.com"))) return null;
   const artwork = String(m.artworkUrl || "");
-  return { trackId: String(m.trackId || "").slice(0, 40), title: String(m.title || "Unknown song").slice(0, 120), artist: String(m.artist || "").slice(0, 120), artworkUrl: /^https:\/\//.test(artwork) ? artwork.slice(0, 500) : null, previewUrl: previewUrl.slice(0, 500) };
+  // Which part of the 30s preview to play. startSec/endSec are seconds into
+  // the clip; the app loops this window for as long as the post/story plays.
+  const startSec = Math.min(CLIP_SEC - MIN_MUSIC_WINDOW_SEC, Math.max(0, Math.round(Number(m.startSec) || 0)));
+  const rawEnd = Number(m.endSec);
+  const endSec = Math.min(CLIP_SEC, Math.max(startSec + MIN_MUSIC_WINDOW_SEC, Number.isFinite(rawEnd) ? Math.round(rawEnd) : CLIP_SEC));
+  return { trackId: String(m.trackId || "").slice(0, 40), title: String(m.title || "Unknown song").slice(0, 120), artist: String(m.artist || "").slice(0, 120), artworkUrl: /^https:\/\//.test(artwork) ? artwork.slice(0, 500) : null, previewUrl: previewUrl.slice(0, 500), startSec, endSec };
 }
 // Text stickers placed on a photo/video. x/y/scale are relative so they look
 // the same at any screen size.
@@ -462,7 +494,8 @@ app.post("/api/stories", auth, async (req, res, next) => {
     const text = String(req.body?.text || "").trim().slice(0, 500);
     const media = req.body?.media || null;
     if (!media) return res.status(400).json({ error: "Add a photo or video." });
-    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
+    if (videoTooLong(media, req.body?.duration)) return res.status(400).json({ error: `Videos can be up to ${MAX_VIDEO_SEC} seconds.` });
+    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, duration: cleanDuration("story", media, req.body?.duration), music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
     // Expired stories are removed for good whenever a new one is saved.
     req.db.stories = req.db.stories.filter(s => s.expiresAt > Date.now());
     req.db.stories.push(story);
