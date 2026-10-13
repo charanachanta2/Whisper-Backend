@@ -354,7 +354,7 @@ app.post("/api/posts/:postId/like", auth, async (req, res, next) => {
     if (!want && had) post.likes = post.likes.filter(u => u !== req.user.id);
     await saveState(req.db);
     if (want && !had && post.userId !== req.user.id) {
-      await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [post.userId], build: () => ({ kind: "post_like", title: "New like", body: `${req.user.name} liked your post`, tag: `like-${post.id}-${req.user.id}` }) }).catch(console.error);
+      await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [post.userId], build: () => ({ kind: "post_like", title: "New like", body: `${req.user.name} liked your post`, tag: `like-${post.id}-${req.user.id}`, postId: post.id }) }).catch(console.error);
     }
     res.json({ post: postForClient(req.db, post, req.user.id) });
   } catch (error) { next(error); }
@@ -371,7 +371,7 @@ app.post("/api/posts/:postId/comments", auth, async (req, res, next) => {
     await saveState(req.db);
     // Post owner hears about every comment; earlier commenters are not pinged (keeps it quiet).
     if (post.userId !== req.user.id) {
-      await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [post.userId], build: () => ({ kind: "post_comment", title: "New comment", body: `${req.user.name}: ${text.slice(0, 100)}`, tag: `comment-${comment.id}` }) }).catch(console.error);
+      await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [post.userId], build: () => ({ kind: "post_comment", title: "New comment", body: `${req.user.name}: ${text.slice(0, 100)}`, tag: `comment-${comment.id}`, postId: post.id }) }).catch(console.error);
     }
     res.json({ post: postForClient(req.db, post, req.user.id) });
   } catch (error) { next(error); }
@@ -392,6 +392,38 @@ app.delete("/api/posts/:postId/comments/:commentId", auth, async (req, res, next
 app.get("/api/stories", auth, (req, res) => res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || connected(req.db, req.user.id, s.userId))) }));
 app.post("/api/stories", auth, async (req, res, next) => { try { const text = String(req.body?.text || "").trim().slice(0, 500); const media = req.body?.media || null; if (!text && !media) return res.status(400).json({ error: "Add text or a photo." }); const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, createdAt: new Date().toISOString(), expiresAt: Date.now() + 86400000 }; req.db.stories.push(story); await saveState(req.db); res.json({ story }); } catch (error) { next(error); } });
 
+
+// --- Notification inbox (the in-app bell) ---
+function myNotifications(db, userId) {
+  return (db.notifications || []).filter(n => n.userId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+app.get("/api/notifications", auth, (req, res) => {
+  const list = myNotifications(req.db, req.user.id);
+  res.json({ notifications: list.slice(0, 100), unreadCount: list.filter(n => !n.read).length });
+});
+// Body { ids: [...] } marks those read; { all: true } (or no body) marks everything read.
+app.post("/api/notifications/read", auth, async (req, res, next) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? new Set(req.body.ids.map(String)) : null;
+    for (const n of req.db.notifications || []) if (n.userId === req.user.id && (!ids || ids.has(n.id))) n.read = true;
+    await saveState(req.db);
+    res.json({ unreadCount: myNotifications(req.db, req.user.id).filter(n => !n.read).length });
+  } catch (error) { next(error); }
+});
+app.delete("/api/notifications/:id", auth, async (req, res, next) => {
+  try {
+    req.db.notifications = (req.db.notifications || []).filter(n => !(n.id === req.params.id && n.userId === req.user.id));
+    await saveState(req.db);
+    res.json({ unreadCount: myNotifications(req.db, req.user.id).filter(n => !n.read).length });
+  } catch (error) { next(error); }
+});
+app.delete("/api/notifications", auth, async (req, res, next) => {
+  try {
+    req.db.notifications = (req.db.notifications || []).filter(n => n.userId !== req.user.id);
+    await saveState(req.db);
+    res.json({ unreadCount: 0 });
+  } catch (error) { next(error); }
+});
 
 // --- Web push subscriptions (iPhone home-screen app / browsers) ---
 app.get("/api/push/public-key", auth, (req, res) => res.json({ publicKey: isPushEnabled() ? pushPublicKey : null }));

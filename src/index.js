@@ -51,6 +51,14 @@ io.on("connection", socket => {
     socket.join(roomId); socket.data.roomId = roomId;
     const state = helpers.roomForClient(db, room, socket.user.id);
     socket.emit("room_state", state); io.to(roomId).emit("members_changed", state.members);
+    // Opening a chat counts as reading its notification.
+    if ((db.notifications || []).some(n => n.userId === socket.user.id && n.roomId === roomId && !n.read)) {
+      try {
+        const fresh = await helpers.loadState();
+        for (const n of fresh.notifications || []) if (n.userId === socket.user.id && n.roomId === roomId) n.read = true;
+        await helpers.saveState(fresh);
+      } catch (error) { console.error("[notify] mark read failed:", error.message); }
+    }
   });
   socket.on("leave_room", ({ roomId }) => {
     if (roomId) socket.leave(roomId);

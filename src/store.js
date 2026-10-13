@@ -7,7 +7,7 @@ require("dotenv").config();
 let clientPromise;
 
 function emptyState() {
-  return { users: [], rooms: [], invites: [], messages: [], friendRequests: [], posts: [], stories: [], pushSubscriptions: [] };
+  return { users: [], rooms: [], invites: [], messages: [], friendRequests: [], posts: [], stories: [], pushSubscriptions: [], notifications: [] };
 }
 
 async function collection() {

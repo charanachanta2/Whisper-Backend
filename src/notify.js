@@ -33,12 +33,53 @@ async function userIsActive(io, userId) {
   } catch (_) { return false; }
 }
 
+// --- Persistent notification inbox -------------------------------------
+// Every notification is also saved on the server so the in-app bell keeps a
+// history (across devices and restarts). Entries with the same `tag` for the
+// same person (e.g. several messages in one chat) are merged into one row that
+// is bumped to the top and marked unread again, instead of flooding the list.
+const MAX_PER_USER = 200;
+const MAX_AGE_MS = 60 * 24 * 3600 * 1000;
+function newId() { return "ntf_" + require("crypto").randomBytes(10).toString("hex"); }
+
+async function storeNotifications(entries) {
+  const fresh = await loadState();
+  fresh.notifications = fresh.notifications || [];
+  const now = new Date().toISOString();
+  const cutoff = Date.now() - MAX_AGE_MS;
+  for (const { userId, payload } of entries) {
+    const { room, ...data } = payload;
+    const existing = data.tag ? fresh.notifications.find(x => x.userId === userId && x.tag === data.tag) : null;
+    if (existing) {
+      Object.assign(existing, data, { read: false, createdAt: now });
+      payload.notificationId = existing.id;
+    } else {
+      const entry = { id: newId(), userId, ...data, read: false, createdAt: now };
+      fresh.notifications.push(entry);
+      payload.notificationId = entry.id;
+    }
+  }
+  // Trim old rows and cap each person's history.
+  const perUser = new Map();
+  fresh.notifications.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  fresh.notifications = fresh.notifications.filter(x => {
+    if (new Date(x.createdAt).getTime() < cutoff) return false;
+    const c = (perUser.get(x.userId) || 0) + 1;
+    perUser.set(x.userId, c);
+    return c <= MAX_PER_USER;
+  });
+  await saveState(fresh);
+}
+
 // build(userId) returns that person's payload:
 // { kind, title, body, tag, roomId?, room? }. `room` is only used in-app.
 async function notifyUsers({ io, db, userIds, build }) {
   const unique = [...new Set(userIds)].filter(Boolean);
   if (!unique.length) return;
   const payloads = new Map(unique.map(uid => [uid, build(uid)]));
+  // Save to each person's notification history first (never blocks delivery if it fails).
+  try { await storeNotifications(unique.map(uid => ({ userId: uid, payload: payloads.get(uid) }))); }
+  catch (error) { console.error("[notify] could not store history:", error.message); }
 
   for (const uid of unique) {
     if (io) io.to(`user:${uid}`).emit("notification", payloads.get(uid));
@@ -87,4 +128,4 @@ function previewFor(message) {
   return `📎 ${message.fileName || "File"}`;
 }
 
-module.exports = { notifyUsers, previewFor, pushPublicKey: PUBLIC_KEY, isPushEnabled: () => pushEnabled };
+module.exports = { notifyUsers, newId, previewFor, pushPublicKey: PUBLIC_KEY, isPushEnabled: () => pushEnabled };
