@@ -757,4 +757,4 @@ app.post("/api/push/unsubscribe", auth, async (req, res, next) => {
 
 app.use((error, req, res, next) => { console.error(error); res.status(500).json({ error: "Server storage is unavailable. Please try again." }); });
 
-module.exports = { app, videos, helpers: { verify, roomForClient, loadState, saveState, purgeExpiredStories } };
+module.exports = { app, videos, helpers: { verify, roomForClient, loadState, saveState, purgeExpiredStories, deleteMedia } };

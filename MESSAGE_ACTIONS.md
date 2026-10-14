@@ -1,0 +1,31 @@
+# Reply, delete and react to messages
+
+All three work over the existing Socket.IO connection (same room you joined with `join_room`).
+Every event takes an optional ack callback that returns `{ ok, ... }` or `{ ok:false, error }`.
+
+## Reply
+`send_message` now accepts `replyToId` (id of any message in the same room, yours or someone else's).
+
+The saved/broadcast message gets:
+```json
+"replyTo": { "id", "userId", "userName", "type", "text", "mimeType", "fileName" }
+```
+`text` is the first 140 characters of a text message (or the song title for music). It is `null` for no reply.
+
+## React
+Emit `react_message` with `{ roomId, messageId, emoji }`.
+
+- One reaction per person per message. A different emoji switches yours; the same emoji again removes it.
+- Server broadcasts `message_reaction` `{ roomId, messageId, reactions }` to the room.
+- `reactions` is an array: `[{ userId, userName, emoji }]`. Every message has it (empty array if none).
+
+## Delete (for everyone)
+Emit `delete_message` with `{ roomId, messageId }`. Only the sender can delete their own message.
+
+- Server broadcasts `message_deleted` `{ roomId, messageId, repliesUpdated: [messageIds] }`.
+- Remove the message from the list on receipt.
+- Replies that quoted it now have `replyTo.type === "deleted"` and empty text: show "This message was deleted" in the quote.
+- Photos/videos/files of a deleted message are also removed from R2.
+
+`room_state` and `/api/rooms/...` already include `replyTo` and `reactions`, so history loads with them.
+Messages sent before this update have no `replyTo`/`reactions`: treat missing as `null` / `[]`.
