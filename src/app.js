@@ -8,6 +8,7 @@ const compression = require("compression");
 const { loadState, saveState, avatarsCollection, findInvite, consumeInvite } = require("./store");
 const { notifyUsers, pushPublicKey, isPushEnabled } = require("./notify");
 const { Binary } = require("mongodb");
+const music = require("./music");
 const storage = require("./storage");
 const { optimizeImage, optimizeAvatar, makeAvatarThumb, createVideoCompressor, extFor } = require("./media");
 
@@ -157,7 +158,7 @@ function postForClient(db, post, viewerId) {
 // A post/story can optionally be limited to chosen friends (`audience` = list of user ids; null/absent = all friends).
 function canViewItem(db, viewerId, item) {
   if (item.userId === viewerId) return true;
-  if (!connected(db, viewerId, item.userId)) return false;
+  if (!isFollowing(db, viewerId, item.userId)) return false;
   return audienceAllows(item, viewerId);
 }
 // Everyone in the audience can see it, and so can anyone who was mentioned in it.
@@ -263,6 +264,7 @@ async function auth(req, res, next) {
     if (!user) return res.status(401).json({ error: "User not found" });
     req.db = db;
     req.user = user;
+    if (ensureFollows(db)) await saveState(db);
     next();
   } catch (error) { next(error); }
 }
@@ -487,11 +489,34 @@ app.get("/api/rooms", auth, (req, res) => {
 app.post("/api/rooms", auth, async (req, res, next) => { try { const isVoice = Boolean(req.body?.isVoice); const room = { id: id("room_"), name: String(req.body?.name || (isVoice ? "Voice room" : "Private chat")).trim().slice(0, 80), members: [req.user.id], isVoice, createdAt: new Date().toISOString() }; req.db.rooms.push(room); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 app.post("/api/rooms/:roomId/invite", auth, async (req, res, next) => { try { const room = req.db.rooms.find(r => r.id === req.params.roomId); if (!room || !room.members.includes(req.user.id)) return res.status(403).json({ error: "Not a member." }); if (room.directKey) return res.status(400).json({ error: "Direct messages can't have people added. Start a room instead." }); const target = req.db.users.find(u => u.username === String(req.body?.username || "").trim().toLowerCase()); if (!target) return res.status(404).json({ error: "User not found." }); if (!room.members.includes(target.id)) room.members.push(target.id); await saveState(req.db); res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
 
-function connected(db, firstId, secondId) { return db.friendRequests.some(r => r.status === "accepted" && ((r.fromUserId === firstId && r.toUserId === secondId) || (r.fromUserId === secondId && r.toUserId === firstId))); }
-// All of a person's accepted friends as a Set, built once per request (connected() rescans every friend request on each call).
+// --- Follows ---
+// A follow is one-directional: `followerId` follows `followeeId` and sees their posts and stories.
+// Following back is just the other person following you. Older "friend requests" are converted once
+// (accepted = both people follow each other, pending = the sender follows the receiver, declined = nothing).
+function ensureFollows(db) {
+  if (!Array.isArray(db.follows)) db.follows = [];
+  let changed = false;
+  const has = (a, b) => db.follows.some(f => f.followerId === a && f.followeeId === b);
+  for (const r of db.friendRequests || []) {
+    if (r.migrated) continue;
+    r.migrated = true; changed = true;
+    if (r.status === "declined") continue;
+    const at = r.acceptedAt || r.createdAt || new Date().toISOString();
+    if (!has(r.fromUserId, r.toUserId)) db.follows.push({ followerId: r.fromUserId, followeeId: r.toUserId, createdAt: at });
+    if (r.status === "accepted" && !has(r.toUserId, r.fromUserId)) db.follows.push({ followerId: r.toUserId, followeeId: r.fromUserId, createdAt: at });
+  }
+  return changed;
+}
+function isFollowing(db, followerId, followeeId) { return (db.follows || []).some(f => f.followerId === followerId && f.followeeId === followeeId); }
+// Either person follows the other: enough to message each other.
+function connected(db, firstId, secondId) { return isFollowing(db, firstId, secondId) || isFollowing(db, secondId, firstId); }
+// People `userId` follows (their feed and stories come from these), and people who follow `userId`.
+function followingIds(db, userId) { const set = new Set(); for (const f of db.follows || []) if (f.followerId === userId) set.add(f.followeeId); return set; }
+function followerIds(db, userId) { const set = new Set(); for (const f of db.follows || []) if (f.followeeId === userId) set.add(f.followerId); return set; }
+// Everyone connected to a person in either direction (used for mentions and the "who can see this" picker).
 function friendIds(db, userId) {
   const set = new Set();
-  for (const r of db.friendRequests) if (r.status === "accepted") { if (r.fromUserId === userId) set.add(r.toUserId); else if (r.toUserId === userId) set.add(r.fromUserId); }
+  for (const f of db.follows || []) { if (f.followerId === userId) set.add(f.followeeId); else if (f.followeeId === userId) set.add(f.followerId); }
   return set;
 }
 function socialUser(user) { return { id: user.id, username: user.username, name: user.name, avatarUrl: user.avatarUrl || null, avatarThumbUrl: avatarThumb(user.avatarUrl) }; }
@@ -503,7 +528,7 @@ app.post("/api/dm/:userId", auth, async (req, res, next) => {
   try {
     const target = req.db.users.find(u => u.id === req.params.userId);
     if (!target || target.id === req.user.id) return res.status(404).json({ error: "User not found." });
-    if (!connected(req.db, req.user.id, target.id)) return res.status(403).json({ error: "You need to be friends before you can message them." });
+    if (!connected(req.db, req.user.id, target.id)) return res.status(403).json({ error: "Follow them (or have them follow you) before you can message them." });
     const room = getOrCreateDirectRoom(req.db, req.user.id, target.id);
     if (room.hidden) delete room.hidden[req.user.id]; // searching their name again brings the chat back (empty, since it was cleared)
     await saveState(req.db);
@@ -525,53 +550,92 @@ app.delete("/api/rooms/:roomId", auth, async (req, res, next) => {
 });
 
 // The signed-in person's friends -- used to pick who can see a post or story.
+// Default: people who follow you (they're who can see a post you limit to "some people").
+// ?scope=chat: everyone you can message (you follow them or they follow you).
 app.get("/api/friends", auth, (req, res) => {
-  const ids = friendIds(req.db, req.user.id);
+  const ids = req.query.scope === "chat" ? friendIds(req.db, req.user.id) : followerIds(req.db, req.user.id);
   res.json({ friends: req.db.users.filter(u => ids.has(u.id) && u.active !== false).map(u => ({ ...socialUser(u), avatarUrl: u.avatarUrl || null })).sort((a, b) => a.name.localeCompare(b.name)) });
 });
-// Followers / following, taken from who sent the friend request:
-//   following = people you asked to connect with who accepted; followers = people whose request you accepted.
+// Followers / following with who-follows-whom flags so the app can show "Follow", "Following" and "Follow back".
+function withFollowFlags(db, me, user) {
+  return { ...socialUser(user), followedByMe: isFollowing(db, me, user.id), followsMe: isFollowing(db, user.id, me) };
+}
 app.get("/api/me/connections", auth, (req, res) => {
   const me = req.user.id;
-  const accepted = req.db.friendRequests.filter(r => r.status === "accepted").sort((a, b) => String(b.acceptedAt || b.createdAt).localeCompare(String(a.acceptedAt || a.createdAt)));
-  const pick = (uid) => { const u = req.db.users.find(x => x.id === uid && x.active !== false); return u ? socialUser(u) : null; };
-  const followers = [], following = [];
-  for (const r of accepted) {
-    if (r.toUserId === me) { const u = pick(r.fromUserId); if (u && !followers.some(x => x.id === u.id)) followers.push(u); }
-    else if (r.fromUserId === me) { const u = pick(r.toUserId); if (u && !following.some(x => x.id === u.id)) following.push(u); }
-  }
+  const byNewest = (a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || ""));
+  const mk = (list, key) => list.sort(byNewest).map(f => req.db.users.find(u => u.id === f[key] && u.active !== false)).filter(Boolean).map(u => withFollowFlags(req.db, me, u));
+  const followers = mk(req.db.follows.filter(f => f.followeeId === me), "followerId");
+  const following = mk(req.db.follows.filter(f => f.followerId === me), "followeeId");
   res.json({ followers, following, followersCount: followers.length, followingCount: following.length });
 });
 app.get("/api/users/search", auth, (req, res) => {
   const query = String(req.query.q || "").trim().toLowerCase();
   if (!query) return res.json({ users: [] });
-  const users = req.db.users.filter(u => u.id !== req.user.id && (u.username.includes(query) || u.name.toLowerCase().includes(query))).slice(0, 20).map(u => ({ ...socialUser(u), connected: connected(req.db, req.user.id, u.id) }));
+  const users = req.db.users.filter(u => u.active !== false && u.id !== req.user.id && (u.username.includes(query) || u.name.toLowerCase().includes(query))).slice(0, 20).map(u => { const f = withFollowFlags(req.db, req.user.id, u); return { ...f, connected: f.followedByMe || f.followsMe }; });
   res.json({ users });
 });
-app.get("/api/friends/requests", auth, (req, res) => res.json({ incoming: req.db.friendRequests.filter(r => r.toUserId === req.user.id && r.status === "pending").map(r => ({ ...r, from: socialUser(req.db.users.find(u => u.id === r.fromUserId)) })), // A declined request still looks "pending" to the sender: they are never told.
- outgoing: req.db.friendRequests.filter(r => r.fromUserId === req.user.id && (r.status === "pending" || r.status === "declined")).map(r => ({ id: r.id, fromUserId: r.fromUserId, toUserId: r.toUserId, status: "pending", createdAt: r.createdAt })) }));
-app.post("/api/friends/requests", auth, async (req, res, next) => { try { const username = String(req.body?.username || "").trim().toLowerCase(); const userId = String(req.body?.userId || "").trim(); const target = req.db.users.find(u => u.id === userId) || req.db.users.find(u => u.username === username); if (!target || target.id === req.user.id) return res.status(404).json({ error: "User not found." }); if (connected(req.db, req.user.id, target.id) || req.db.friendRequests.some(r => (r.status === "pending" && ((r.fromUserId === req.user.id && r.toUserId === target.id) || (r.fromUserId === target.id && r.toUserId === req.user.id))) || (r.status === "declined" && r.fromUserId === req.user.id && r.toUserId === target.id))) return res.status(409).json({ error: "A request already exists." }); const request = { id: id("req_"), fromUserId: req.user.id, toUserId: target.id, status: "pending", createdAt: new Date().toISOString() }; req.db.friendRequests.push(request); await saveState(req.db);
-  // Send the notification before responding: on serverless hosts (Vercel) the function can be frozen right after the response.
-  await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [target.id], build: () => ({ kind: "friend_request", title: "New friend request", body: `${req.user.name} wants to connect with you`, tag: `friend-${request.id}`, requestId: request.id, fromUserId: req.user.id }) }).catch(console.error);
-  res.json({ request }); } catch (error) { next(error); } });
-function dropFriendRequestNotifications(db, userId, requestId) {
-  db.notifications = (db.notifications || []).filter(n => !(n.userId === userId && n.kind === "friend_request" && (n.requestId === requestId || n.tag === `friend-${requestId}`)));
-}
-// Declining is silent: nobody is notified, and the sender keeps seeing "Requested".
-app.post("/api/friends/requests/:requestId/decline", auth, async (req, res, next) => {
+// People you may know: followed by people you follow, or who follow you and you don't follow back yet.
+app.get("/api/users/suggested", auth, (req, res) => {
+  const me = req.user.id, db = req.db;
+  const mine = followingIds(db, me), score = new Map();
+  for (const f of db.follows) {
+    if (f.followeeId === me || mine.has(f.followeeId)) continue;
+    if (mine.has(f.followerId)) score.set(f.followeeId, (score.get(f.followeeId) || 0) + 1);
+  }
+  for (const id2 of followerIds(db, me)) if (!mine.has(id2)) score.set(id2, (score.get(id2) || 0) + 5);
+  const users = [...score.entries()].sort((a, b) => b[1] - a[1]).map(([uid]) => db.users.find(u => u.id === uid && u.active !== false)).filter(Boolean).slice(0, 20).map(u => ({ ...withFollowFlags(db, me, u), connected: false }));
+  res.json({ users });
+});
+// Follow / unfollow (instant). Following someone who already follows you is "following back".
+app.post("/api/follow/:userId", auth, async (req, res, next) => {
   try {
-    const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending");
-    if (!request) return res.status(404).json({ error: "Request not found." });
-    request.status = "declined"; request.declinedAt = new Date().toISOString();
-    dropFriendRequestNotifications(req.db, req.user.id, request.id);
+    const target = req.db.users.find(u => u.id === req.params.userId && u.active !== false);
+    if (!target || target.id === req.user.id) return res.status(404).json({ error: "User not found." });
+    if (!isFollowing(req.db, req.user.id, target.id)) {
+      req.db.follows.push({ followerId: req.user.id, followeeId: target.id, createdAt: new Date().toISOString() });
+      await saveState(req.db);
+      const followedBack = isFollowing(req.db, target.id, req.user.id);
+      await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [target.id], build: () => ({ kind: "follow", title: followedBack ? "Followed you back" : "New follower", body: followedBack ? `${req.user.name} followed you back` : `${req.user.name} started following you`, tag: `follow-${req.user.id}`, fromUserId: req.user.id, followedBack }) }).catch(console.error);
+    }
+    res.json({ user: withFollowFlags(req.db, req.user.id, target) });
+  } catch (error) { next(error); }
+});
+app.delete("/api/follow/:userId", auth, async (req, res, next) => {
+  try {
+    const target = req.db.users.find(u => u.id === req.params.userId);
+    if (!target) return res.status(404).json({ error: "User not found." });
+    const before = req.db.follows.length;
+    req.db.follows = req.db.follows.filter(f => !(f.followerId === req.user.id && f.followeeId === target.id));
+    if (req.db.follows.length !== before) await saveState(req.db);
+    res.json({ user: withFollowFlags(req.db, req.user.id, target) });
+  } catch (error) { next(error); }
+});
+// Removes someone from your followers.
+app.delete("/api/followers/:userId", auth, async (req, res, next) => {
+  try {
+    req.db.follows = req.db.follows.filter(f => !(f.followerId === req.params.userId && f.followeeId === req.user.id));
     await saveState(req.db);
     res.json({ ok: true });
   } catch (error) { next(error); }
 });
-app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next) => { try { const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending"); if (!request) return res.status(404).json({ error: "Request not found." }); request.status = "accepted"; request.acceptedAt = new Date().toISOString(); const room = getOrCreateDirectRoom(req.db, request.fromUserId, request.toUserId); dropFriendRequestNotifications(req.db, req.user.id, request.id); await saveState(req.db);
-  await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [request.fromUserId], build: uid => { const { messages, members, ...lite } = roomForClient(req.db, room, uid, { withMessages: false }); return { kind: "friend_accept", title: "Friend request accepted", body: `${req.user.name} accepted your request`, tag: `friend-${request.id}`, roomId: room.id, room: lite }; } }).catch(console.error);
-  res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
-app.get("/api/posts", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || (friends.has(p.userId) && audienceAllows(p, req.user.id))).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }); });
+// Legacy friend-request endpoints (older app builds): a "request" is now simply a follow, and "accept" is a follow back.
+app.get("/api/friends/requests", auth, (req, res) => res.json({ incoming: [], outgoing: [] }));
+app.post("/api/friends/requests", auth, async (req, res, next) => {
+  try {
+    const username = String(req.body?.username || "").trim().toLowerCase();
+    const userId = String(req.body?.userId || "").trim();
+    const target = req.db.users.find(u => u.id === userId) || req.db.users.find(u => u.username === username);
+    if (!target || target.id === req.user.id) return res.status(404).json({ error: "User not found." });
+    if (isFollowing(req.db, req.user.id, target.id)) return res.status(409).json({ error: "You already follow this person." });
+    req.db.follows.push({ followerId: req.user.id, followeeId: target.id, createdAt: new Date().toISOString() });
+    await saveState(req.db);
+    await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [target.id], build: () => ({ kind: "follow", title: "New follower", body: `${req.user.name} started following you`, tag: `follow-${req.user.id}`, fromUserId: req.user.id }) }).catch(console.error);
+    res.json({ request: { id: id("req_"), fromUserId: req.user.id, toUserId: target.id, status: "accepted" } });
+  } catch (error) { next(error); }
+});
+app.post("/api/friends/requests/:requestId/decline", auth, (req, res) => res.json({ ok: true }));
+app.post("/api/friends/requests/:requestId/accept", auth, (req, res) => res.status(410).json({ error: "Friend requests were replaced by Follow. Use Follow back on the person's profile." }));
+app.get("/api/posts", auth, (req, res) => { const friends = followingIds(req.db, req.user.id); res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || (friends.has(p.userId) && audienceAllows(p, req.user.id))).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }); });
 app.post("/api/posts", auth, async (req, res, next) => {
   try {
     const text = String(req.body?.text || "").trim().slice(0, 2000);
@@ -624,34 +688,26 @@ app.delete("/api/posts/:postId", auth, async (req, res, next) => {
 // The picker in the app enforces this too, but the server is the real gate.
 const MAX_VIDEO_SEC = 60;
 const PHOTO_LIMITS = { post: { min: 15, max: 30, def: 15 }, story: { min: 3, max: 15, def: 5 } };
-const CLIP_SEC = 30; // iTunes previews are 30 seconds long
 const MIN_MUSIC_WINDOW_SEC = 5;
-function isVideoMedia(media) { return String(media?.mimeType || "").startsWith("video/"); }
-// A video longer than the cap (1s of slack for rounding) is rejected outright.
-function videoTooLong(media, raw) { const n = Number(raw); return isVideoMedia(media) && Number.isFinite(n) && n > MAX_VIDEO_SEC + 1; }
-function cleanDuration(kind, media, raw) {
-  const n = Number(raw);
-  if (isVideoMedia(media)) return Number.isFinite(n) && n > 0 ? Math.min(MAX_VIDEO_SEC, Math.round(n)) : MAX_VIDEO_SEC;
-  const lim = PHOTO_LIMITS[kind];
-  return Number.isFinite(n) ? Math.min(lim.max, Math.max(lim.min, Math.round(n))) : lim.def;
-}
-// --- Music + text overlays attached to posts and stories ---
-// Music is a 30-second preview clip chosen from Apple's public iTunes Search
-// catalogue (no account/key needed). Only the metadata and the preview URL
-// are stored; the audio itself stays on Apple's servers.
+const MAX_MUSIC_WINDOW_SEC = 90; // longest part of a song one post/story can use
+const MAX_SONG_SEC = 60 * 60;
+// Music is a full-length song (Jamendo) or a 30s Apple preview (fallback). The person picks any part of it:
+// startSec/endSec are seconds into the song, and the app loops that window while the post/story plays.
 function cleanMusic(m) {
   if (!m || typeof m !== "object") return null;
   const previewUrl = String(m.previewUrl || "");
   let host = "";
   try { host = new URL(previewUrl).hostname; } catch (_) { return null; }
-  if (!/^https:/.test(previewUrl) || !(host.endsWith(".mzstatic.com") || host.endsWith(".apple.com"))) return null;
+  if (!/^https:/.test(previewUrl) || !music.allowedAudioHost(host)) return null;
   const artwork = String(m.artworkUrl || "");
-  // Which part of the 30s preview to play. startSec/endSec are seconds into
-  // the clip; the app loops this window for as long as the post/story plays.
-  const startSec = Math.min(CLIP_SEC - MIN_MUSIC_WINDOW_SEC, Math.max(0, Math.round(Number(m.startSec) || 0)));
+  const isApple = host.endsWith(".mzstatic.com") || host.endsWith(".apple.com");
+  const rawDur = Math.round(Number(m.durationSec));
+  const durationSec = isApple ? 30 : Math.min(MAX_SONG_SEC, Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 180);
+  const startSec = Math.min(Math.max(0, durationSec - MIN_MUSIC_WINDOW_SEC), Math.max(0, Math.round(Number(m.startSec) || 0)));
   const rawEnd = Number(m.endSec);
-  const endSec = Math.min(CLIP_SEC, Math.max(startSec + MIN_MUSIC_WINDOW_SEC, Number.isFinite(rawEnd) ? Math.round(rawEnd) : CLIP_SEC));
-  return { trackId: String(m.trackId || "").slice(0, 40), title: String(m.title || "Unknown song").slice(0, 120), artist: String(m.artist || "").slice(0, 120), artworkUrl: /^https:\/\//.test(artwork) ? artwork.slice(0, 500) : null, previewUrl: previewUrl.slice(0, 500), startSec, endSec };
+  let endSec = Math.min(durationSec, Math.max(startSec + MIN_MUSIC_WINDOW_SEC, Number.isFinite(rawEnd) ? Math.round(rawEnd) : startSec + 30));
+  endSec = Math.min(endSec, startSec + MAX_MUSIC_WINDOW_SEC);
+  return { trackId: String(m.trackId || "").slice(0, 40), title: String(m.title || "Unknown song").slice(0, 120), artist: String(m.artist || "").slice(0, 120), artworkUrl: /^https:\/\//.test(artwork) ? artwork.slice(0, 500) : null, previewUrl: previewUrl.slice(0, 500), durationSec, genre: m.genre ? String(m.genre).slice(0, 40) : null, startSec, endSec };
 }
 // Text stickers placed on a photo/video. x/y/scale are relative so they look
 // the same at any screen size.
@@ -670,21 +726,21 @@ function cleanOverlays(list) {
 app.get("/api/music/search", auth, async (req, res) => {
   const q = String(req.query.q || "").trim().slice(0, 100);
   if (!q) return res.json({ results: [] });
+  try { res.json({ results: await music.searchTracks(q, 30) }); }
+  catch (error) { console.error("[music] search failed:", error.message); res.status(502).json({ error: "Music search is unavailable right now. Please try again." }); }
+});
+// What the picker shows before you type: songs picked for you, trending now, and genre shelves.
+app.get("/api/music/browse", auth, async (req, res) => {
+  const genre = String(req.query.genre || "").slice(0, 40);
   try {
-    const url = `https://itunes.apple.com/search?media=music&entity=song&limit=25&term=${encodeURIComponent(q)}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!r.ok) throw new Error(`iTunes ${r.status}`);
-    const data = await r.json();
-    const results = (data.results || []).filter(t => t.previewUrl).map(t => ({
-      trackId: String(t.trackId), title: t.trackName, artist: t.artistName,
-      artworkUrl: t.artworkUrl100 ? t.artworkUrl100.replace("100x100", "300x300") : null,
-      previewUrl: t.previewUrl,
-    }));
-    res.json({ results });
-  } catch (error) {
-    console.error("[music] search failed:", error.message);
-    res.status(502).json({ error: "Music search is unavailable right now. Please try again." });
-  }
+    if (genre) return res.json({ sections: [{ id: "genre", title: genre, tracks: await music.trendingTracks({ genre, limit: 30 }) }], genres: music.GENRES });
+    const [suggested, trending] = await Promise.allSettled([music.suggestTracks(req.db, req.user.id, followingIds(req.db, req.user.id), 30), music.trendingTracks({ limit: 30 })]);
+    const sections = [];
+    if (suggested.status === "fulfilled" && suggested.value.length) sections.push({ id: "suggested", title: "Suggested for you", tracks: suggested.value });
+    if (trending.status === "fulfilled" && trending.value.length) sections.push({ id: "trending", title: "Trending now", tracks: trending.value });
+    if (!sections.length) return res.status(502).json({ error: "Music is unavailable right now. Please try again." });
+    res.json({ sections, genres: music.GENRES });
+  } catch (error) { console.error("[music] browse failed:", error.message); res.status(502).json({ error: "Music is unavailable right now. Please try again." }); }
 });
 
 // --- Likes & comments ---
@@ -762,7 +818,7 @@ function storyForClient(db, story, viewerId) {
   const audienceInfo = viewerId && story.userId === viewerId ? { audience: Array.isArray(story.audience) ? story.audience : null, audienceCount: Array.isArray(story.audience) ? story.audience.length : null } : { audience: undefined };
   return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, userAvatarThumbUrl: author ? avatarThumb(author.avatarUrl) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined, viewerUsers: story.userId === viewerId ? storyViewerList(db, story) : undefined, mentionUsers: mentionUsers(db, story), canReshare: story.userId !== viewerId && (story.mentions || []).includes(viewerId) && !(db.stories || []).some(x => x.userId === viewerId && x.expiresAt > Date.now() && x.sharedFrom && x.sharedFrom.storyId === story.id) };
 }
-app.get("/api/stories", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || (friends.has(s.userId) && audienceAllows(s, req.user.id)))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }); });
+app.get("/api/stories", auth, (req, res) => { const friends = followingIds(req.db, req.user.id); res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || (friends.has(s.userId) && audienceAllows(s, req.user.id)))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }); });
 app.post("/api/stories", auth, async (req, res, next) => {
   try {
     const text = String(req.body?.text || "").trim().slice(0, 500);

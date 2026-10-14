@@ -10,10 +10,10 @@ let clientPromise;
 // are handled with their own atomic operations (see below) so that an invite
 // created by `npm run invite` from another process is never overwritten by
 // this server's in-memory copy of the state.
-const STATE_KEYS = ["users", "rooms", "messages", "friendRequests", "posts", "stories", "pushSubscriptions", "notifications"];
+const STATE_KEYS = ["users", "rooms", "messages", "friendRequests", "follows", "posts", "stories", "pushSubscriptions", "notifications"];
 
 function emptyState() {
-  return { users: [], rooms: [], invites: [], messages: [], friendRequests: [], posts: [], stories: [], pushSubscriptions: [], notifications: [] };
+  return { users: [], rooms: [], invites: [], messages: [], friendRequests: [], follows: [], posts: [], stories: [], pushSubscriptions: [], notifications: [] };
 }
 
 function db() {
