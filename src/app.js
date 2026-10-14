@@ -353,7 +353,7 @@ async function storeUpload(req, buffer, fileName, mimeType, userId) {
     if (thumb) { await fs.promises.writeFile(path.join(UPLOADS_DIR, `${stem}-t.webp`), thumb); thumbUrl = `${publicBaseUrl(req)}/uploads/${stem}-t.webp`; }
     if (isVideo) videos.enqueue(filename);
   }
-  return { url, thumbUrl, mimeType: outType, fileName: displayName || filename, size: out.length, width, height };
+  return { url, thumbUrl: thumbUrl || url, mimeType: outType, fileName: displayName || filename, size: out.length, width, height };
 }
 app.post("/api/upload", auth, uploadJsonLimit, async (req, res) => {
   const contentType = req.headers["content-type"] || "";

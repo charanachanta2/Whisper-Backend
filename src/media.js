@@ -77,13 +77,16 @@ async function optimizeImage(buffer, mime) {
       .toBuffer();
     // Already tiny/optimal? Keep the original bytes (but still return the thumbnail).
     const keepOriginal = main.data.length >= buffer.length * 0.97 && /^image\/(jpeg|png|webp)$/.test(type);
+    // Small photos don't need a separate thumbnail: the main file is already tiny, so
+    // skip it and store just one object in R2 (the caller falls back to the main URL).
+    const small = Math.max(main.info.width, main.info.height) <= THUMB_PX * 1.5 || main.data.length < 40 * 1024;
     return {
       buffer: keepOriginal ? buffer : main.data,
       mimeType: keepOriginal ? type : "image/webp",
       ext: keepOriginal ? null : ".webp",
       width: main.info.width,
       height: main.info.height,
-      thumb,
+      thumb: small ? null : thumb,
     };
   } catch (error) {
     console.error("[media] image optimize failed, storing original:", error.message);
