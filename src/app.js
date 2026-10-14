@@ -221,14 +221,23 @@ function roomForClient(db, room, viewerId, { withMessages = true } = {}) {
     otherUser: otherUser ? publicUser(otherUser) : null,
     memberCount: room.members.length,
     members: room.members.map(uid => db.users.find(u => u.id === uid)).filter(Boolean).map(publicUser),
-    messages: withMessages ? lastMessagesFor(db, room.id, 200) : [],
+    messages: withMessages ? lastMessagesFor(db, room.id, 200, clearedAtFor(room, viewerId)) : [],
   };
 }
+// "Delete chat" only clears the conversation for the person who deleted it (like Instagram/WhatsApp):
+// they stop seeing anything sent before `clearedAt`, the other person keeps their copy.
+function clearedAtFor(room, userId) { return (room.clearedAt && userId && room.clearedAt[userId]) || ""; }
+function isHiddenFor(room, userId) { return Boolean(room.hidden && userId && room.hidden[userId]); }
 // Walks the message list backwards and stops as soon as it has `n` messages
 // for the room, instead of filtering all (up to 5000) messages every time.
-function lastMessagesFor(db, roomId, n) {
+function lastMessagesFor(db, roomId, n, since = "") {
   const out = [];
-  for (let i = db.messages.length - 1; i >= 0 && out.length < n; i--) if (db.messages[i].roomId === roomId) out.push(db.messages[i]);
+  for (let i = db.messages.length - 1; i >= 0 && out.length < n; i--) {
+    const m = db.messages[i];
+    if (m.roomId !== roomId) continue;
+    if (since && m.createdAt <= since) break; // messages are in time order, so everything before this is cleared too
+    out.push(m);
+  }
   return out.reverse();
 }
 // Shared by the friend-request-accept flow and the "message this friend"
@@ -448,10 +457,15 @@ app.post("/api/auth/login", async (req, res, next) => { try { const db = await l
 app.get("/api/rooms", auth, (req, res) => {
   // One pass over the messages to find each room's latest one (was: filter all messages once per room).
   const lastByRoom = new Map();
-  for (const m of req.db.messages) lastByRoom.set(m.roomId, m);
+  const roomsById = new Map(req.db.rooms.map(r => [r.id, r]));
+  for (const m of req.db.messages) {
+    const r = roomsById.get(m.roomId);
+    if (r && m.createdAt <= clearedAtFor(r, req.user.id)) continue; // deleted for this person
+    lastByRoom.set(m.roomId, m);
+  }
   res.json({
   rooms: req.db.rooms
-    .filter(r => r.members.includes(req.user.id))
+    .filter(r => r.members.includes(req.user.id) && !isHiddenFor(r, req.user.id))
     .map(r => {
       const isDirect = Boolean(r.directKey);
       const otherUserId = isDirect ? r.members.find(uid => uid !== req.user.id) : null;
@@ -491,8 +505,22 @@ app.post("/api/dm/:userId", auth, async (req, res, next) => {
     if (!target || target.id === req.user.id) return res.status(404).json({ error: "User not found." });
     if (!connected(req.db, req.user.id, target.id)) return res.status(403).json({ error: "You need to be friends before you can message them." });
     const room = getOrCreateDirectRoom(req.db, req.user.id, target.id);
+    if (room.hidden) delete room.hidden[req.user.id]; // searching their name again brings the chat back (empty, since it was cleared)
     await saveState(req.db);
     res.json({ room: roomForClient(req.db, room, req.user.id) });
+  } catch (error) { next(error); }
+});
+// Delete a 1:1 chat for the person asking. It leaves their chat list and its history is cleared on their side only;
+// the other person keeps theirs. Messaging again (search their name, or a new message from them) starts a fresh thread.
+app.delete("/api/rooms/:roomId", auth, async (req, res, next) => {
+  try {
+    const room = req.db.rooms.find(r => r.id === req.params.roomId);
+    if (!room || !room.members.includes(req.user.id)) return res.status(404).json({ error: "Chat not found." });
+    if (!room.directKey) return res.status(400).json({ error: "Only direct chats can be deleted." });
+    room.clearedAt = { ...(room.clearedAt || {}), [req.user.id]: new Date().toISOString() };
+    room.hidden = { ...(room.hidden || {}), [req.user.id]: true };
+    await saveState(req.db);
+    res.json({ ok: true });
   } catch (error) { next(error); }
 });
 
@@ -500,6 +528,19 @@ app.post("/api/dm/:userId", auth, async (req, res, next) => {
 app.get("/api/friends", auth, (req, res) => {
   const ids = friendIds(req.db, req.user.id);
   res.json({ friends: req.db.users.filter(u => ids.has(u.id) && u.active !== false).map(u => ({ ...socialUser(u), avatarUrl: u.avatarUrl || null })).sort((a, b) => a.name.localeCompare(b.name)) });
+});
+// Followers / following, taken from who sent the friend request:
+//   following = people you asked to connect with who accepted; followers = people whose request you accepted.
+app.get("/api/me/connections", auth, (req, res) => {
+  const me = req.user.id;
+  const accepted = req.db.friendRequests.filter(r => r.status === "accepted").sort((a, b) => String(b.acceptedAt || b.createdAt).localeCompare(String(a.acceptedAt || a.createdAt)));
+  const pick = (uid) => { const u = req.db.users.find(x => x.id === uid && x.active !== false); return u ? socialUser(u) : null; };
+  const followers = [], following = [];
+  for (const r of accepted) {
+    if (r.toUserId === me) { const u = pick(r.fromUserId); if (u && !followers.some(x => x.id === u.id)) followers.push(u); }
+    else if (r.fromUserId === me) { const u = pick(r.toUserId); if (u && !following.some(x => x.id === u.id)) following.push(u); }
+  }
+  res.json({ followers, following, followersCount: followers.length, followingCount: following.length });
 });
 app.get("/api/users/search", auth, (req, res) => {
   const query = String(req.query.q || "").trim().toLowerCase();
@@ -705,12 +746,21 @@ function purgeExpiredStories(db) {
   for (const s of gone) releaseMedia(db, s.mediaOwnerId || s.userId, s.media);
   return gone.length;
 }
+// Who has watched a story, newest first. Only ever sent to the story's author.
+function storyViewerList(db, story) {
+  const times = story.viewTimes || {};
+  return (story.viewers || [])
+    .map(uid => { const u = db.users.find(x => x.id === uid); return u ? { ...socialUser(u), viewedAt: times[uid] || null } : null; })
+    .filter(Boolean)
+    .sort((a, b) => String(b.viewedAt || "").localeCompare(String(a.viewedAt || "")));
+}
 function storyForClient(db, story, viewerId) {
   const author = db.users.find(u => u.id === story.userId);
   const viewers = story.viewers || [];
-  const { viewers: _v, mediaOwnerId: _o, ...rest } = story;
+  // viewTimes is private to the author (it says who looked and when), so it never goes out in the generic story object.
+  const { viewers: _v, mediaOwnerId: _o, viewTimes: _t, ...rest } = story;
   const audienceInfo = viewerId && story.userId === viewerId ? { audience: Array.isArray(story.audience) ? story.audience : null, audienceCount: Array.isArray(story.audience) ? story.audience.length : null } : { audience: undefined };
-  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, userAvatarThumbUrl: author ? avatarThumb(author.avatarUrl) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined, mentionUsers: mentionUsers(db, story), canReshare: story.userId !== viewerId && (story.mentions || []).includes(viewerId) && !(db.stories || []).some(x => x.userId === viewerId && x.expiresAt > Date.now() && x.sharedFrom && x.sharedFrom.storyId === story.id) };
+  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, userAvatarThumbUrl: author ? avatarThumb(author.avatarUrl) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined, viewerUsers: story.userId === viewerId ? storyViewerList(db, story) : undefined, mentionUsers: mentionUsers(db, story), canReshare: story.userId !== viewerId && (story.mentions || []).includes(viewerId) && !(db.stories || []).some(x => x.userId === viewerId && x.expiresAt > Date.now() && x.sharedFrom && x.sharedFrom.storyId === story.id) };
 }
 app.get("/api/stories", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || (friends.has(s.userId) && audienceAllows(s, req.user.id)))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }); });
 app.post("/api/stories", auth, async (req, res, next) => {
@@ -735,9 +785,20 @@ app.post("/api/stories/:storyId/view", auth, async (req, res, next) => {
     const story = req.db.stories.find(s => s.id === req.params.storyId && s.expiresAt > Date.now());
     if (!story || !canViewItem(req.db, req.user.id, story)) return res.status(404).json({ error: "Story not found." });
     story.viewers = story.viewers || [];
-    if (story.userId !== req.user.id && !story.viewers.includes(req.user.id)) { story.viewers.push(req.user.id); await saveState(req.db); }
+    if (story.userId !== req.user.id && !story.viewers.includes(req.user.id)) {
+      story.viewers.push(req.user.id);
+      story.viewTimes = { ...(story.viewTimes || {}), [req.user.id]: new Date().toISOString() };
+      await saveState(req.db);
+    }
     res.json({ ok: true });
   } catch (error) { next(error); }
+});
+// The list of people who viewed one of your stories (author only).
+app.get("/api/stories/:storyId/viewers", auth, (req, res) => {
+  const story = req.db.stories.find(s => s.id === req.params.storyId && s.expiresAt > Date.now());
+  if (!story || story.userId !== req.user.id) return res.status(404).json({ error: "Story not found." });
+  const viewers = storyViewerList(req.db, story);
+  res.json({ viewers, viewCount: viewers.length });
 });
 app.delete("/api/stories/:storyId", auth, async (req, res, next) => {
   try {

@@ -91,6 +91,8 @@ io.on("connection", socket => {
         replyTo = replySnapshot(original);
       }
       const message = { id: id("msg_"), roomId, userId: socket.user.id, userName: socket.user.name, type, text: String(text || "").trim(), fileName: fileName || null, mimeType: mimeType || null, uri: uri || null, size: Number(size) || 0, url: url || null, title: title || null, artist: artist || null, thumbnail: thumbnail || null, thumbUrl: typeof thumbUrl === "string" ? thumbUrl : null, width: Number(width) || null, height: Number(height) || null, replyTo, reactions: [], createdAt: new Date().toISOString() };
+      // A deleted chat (hidden for someone) reappears in their list as soon as there's a new message.
+      if (room.hidden) room.hidden = {};
       db.messages.push(message); if (db.messages.length > 5000) db.messages.splice(0, db.messages.length - 5000);
       await helpers.saveState(db);
       io.to(roomId).emit("new_message", message);
