@@ -150,7 +150,7 @@ function postForClient(db, post, viewerId) {
   const { likes: _l, comments: _c, audience, ...rest } = post;
   // Only the author is told who a post is limited to.
   const audienceInfo = viewerId && post.userId === viewerId ? { audience: Array.isArray(audience) ? audience : null, audienceCount: Array.isArray(audience) ? audience.length : null } : {};
-  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, userAvatarThumbUrl: author ? avatarThumb(author.avatarUrl) : null, likeCount: likes.length, likedByMe: viewerId ? likes.includes(viewerId) : false, commentCount: comments.length, comments };
+  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, userAvatarThumbUrl: author ? avatarThumb(author.avatarUrl) : null, likeCount: likes.length, likedByMe: viewerId ? likes.includes(viewerId) : false, commentCount: comments.length, comments, mentionUsers: mentionUsers(db, post) };
 }
 // A post is visible to its author and their accepted friends -- likes and
 // comments follow the same rule.
@@ -158,7 +158,43 @@ function postForClient(db, post, viewerId) {
 function canViewItem(db, viewerId, item) {
   if (item.userId === viewerId) return true;
   if (!connected(db, viewerId, item.userId)) return false;
-  return !Array.isArray(item.audience) || item.audience.includes(viewerId);
+  return audienceAllows(item, viewerId);
+}
+// Everyone in the audience can see it, and so can anyone who was mentioned in it.
+function audienceAllows(item, viewerId) {
+  return !Array.isArray(item.audience) || item.audience.includes(viewerId) || (item.mentions || []).includes(viewerId);
+}
+// --- Mentions ---
+// A post/story can mention the author's friends, either picked in the app (`mentions`: [userId]) or typed as @username in the text.
+const MAX_MENTIONS = 20;
+function cleanMentions(db, authorId, raw, text) {
+  const friends = friendIds(db, authorId);
+  const ids = new Set();
+  if (Array.isArray(raw)) for (const v of raw) { const uid = String(v); if (friends.has(uid)) ids.add(uid); }
+  for (const m of String(text || "").matchAll(/(^|[^\w@])@([a-z0-9_.]{2,30})/gi)) {
+    const u = db.users.find(x => x.username === m[2].toLowerCase());
+    if (u && friends.has(u.id)) ids.add(u.id);
+  }
+  ids.delete(authorId);
+  return [...ids].slice(0, MAX_MENTIONS);
+}
+function mentionUsers(db, item) {
+  return (item.mentions || []).map(uid => db.users.find(u => u.id === uid)).filter(Boolean).map(u => ({ id: u.id, username: u.username, name: u.name }));
+}
+async function notifyMentioned(req, item, kind) {
+  if (!item.mentions || !item.mentions.length) return;
+  const isStory = kind === "story_mention";
+  await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: item.mentions, build: () => ({
+    kind, title: isStory ? "You were mentioned in a story" : "You were mentioned in a post",
+    body: `${req.user.name} mentioned you in ${isStory ? "their story" : "a post"}`,
+    tag: `mention-${item.id}`, ...(isStory ? { storyId: item.id } : { postId: item.id }),
+  }) }).catch(console.error);
+}
+// A reshared story points at the original's file. Only delete a file once nothing else uses it.
+function releaseMedia(db, ownerId, media) {
+  if (!media) return;
+  if (media.url && (db.stories.some(s => s.media && s.media.url === media.url) || db.posts.some(p => p.media && p.media.url === media.url))) return;
+  deleteMedia(ownerId, media);
 }
 function canSeePost(db, viewerId, post) { return canViewItem(db, viewerId, post); }
 // Reads the requested audience from a request body. undefined/null -> all friends (null). A list is cut down to the author's actual friends.
@@ -471,15 +507,30 @@ app.get("/api/users/search", auth, (req, res) => {
   const users = req.db.users.filter(u => u.id !== req.user.id && (u.username.includes(query) || u.name.toLowerCase().includes(query))).slice(0, 20).map(u => ({ ...socialUser(u), connected: connected(req.db, req.user.id, u.id) }));
   res.json({ users });
 });
-app.get("/api/friends/requests", auth, (req, res) => res.json({ incoming: req.db.friendRequests.filter(r => r.toUserId === req.user.id && r.status === "pending").map(r => ({ ...r, from: socialUser(req.db.users.find(u => u.id === r.fromUserId)) })), outgoing: req.db.friendRequests.filter(r => r.fromUserId === req.user.id && r.status === "pending") }));
-app.post("/api/friends/requests", auth, async (req, res, next) => { try { const username = String(req.body?.username || "").trim().toLowerCase(); const userId = String(req.body?.userId || "").trim(); const target = req.db.users.find(u => u.id === userId) || req.db.users.find(u => u.username === username); if (!target || target.id === req.user.id) return res.status(404).json({ error: "User not found." }); if (connected(req.db, req.user.id, target.id) || req.db.friendRequests.some(r => r.status === "pending" && ((r.fromUserId === req.user.id && r.toUserId === target.id) || (r.fromUserId === target.id && r.toUserId === req.user.id)))) return res.status(409).json({ error: "A request already exists." }); const request = { id: id("req_"), fromUserId: req.user.id, toUserId: target.id, status: "pending", createdAt: new Date().toISOString() }; req.db.friendRequests.push(request); await saveState(req.db);
+app.get("/api/friends/requests", auth, (req, res) => res.json({ incoming: req.db.friendRequests.filter(r => r.toUserId === req.user.id && r.status === "pending").map(r => ({ ...r, from: socialUser(req.db.users.find(u => u.id === r.fromUserId)) })), // A declined request still looks "pending" to the sender: they are never told.
+ outgoing: req.db.friendRequests.filter(r => r.fromUserId === req.user.id && (r.status === "pending" || r.status === "declined")).map(r => ({ id: r.id, fromUserId: r.fromUserId, toUserId: r.toUserId, status: "pending", createdAt: r.createdAt })) }));
+app.post("/api/friends/requests", auth, async (req, res, next) => { try { const username = String(req.body?.username || "").trim().toLowerCase(); const userId = String(req.body?.userId || "").trim(); const target = req.db.users.find(u => u.id === userId) || req.db.users.find(u => u.username === username); if (!target || target.id === req.user.id) return res.status(404).json({ error: "User not found." }); if (connected(req.db, req.user.id, target.id) || req.db.friendRequests.some(r => (r.status === "pending" && ((r.fromUserId === req.user.id && r.toUserId === target.id) || (r.fromUserId === target.id && r.toUserId === req.user.id))) || (r.status === "declined" && r.fromUserId === req.user.id && r.toUserId === target.id))) return res.status(409).json({ error: "A request already exists." }); const request = { id: id("req_"), fromUserId: req.user.id, toUserId: target.id, status: "pending", createdAt: new Date().toISOString() }; req.db.friendRequests.push(request); await saveState(req.db);
   // Send the notification before responding: on serverless hosts (Vercel) the function can be frozen right after the response.
-  await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [target.id], build: () => ({ kind: "friend_request", title: "New friend request", body: `${req.user.name} wants to connect with you`, tag: `friend-${request.id}` }) }).catch(console.error);
+  await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [target.id], build: () => ({ kind: "friend_request", title: "New friend request", body: `${req.user.name} wants to connect with you`, tag: `friend-${request.id}`, requestId: request.id, fromUserId: req.user.id }) }).catch(console.error);
   res.json({ request }); } catch (error) { next(error); } });
-app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next) => { try { const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending"); if (!request) return res.status(404).json({ error: "Request not found." }); request.status = "accepted"; request.acceptedAt = new Date().toISOString(); const room = getOrCreateDirectRoom(req.db, request.fromUserId, request.toUserId); await saveState(req.db);
+function dropFriendRequestNotifications(db, userId, requestId) {
+  db.notifications = (db.notifications || []).filter(n => !(n.userId === userId && n.kind === "friend_request" && (n.requestId === requestId || n.tag === `friend-${requestId}`)));
+}
+// Declining is silent: nobody is notified, and the sender keeps seeing "Requested".
+app.post("/api/friends/requests/:requestId/decline", auth, async (req, res, next) => {
+  try {
+    const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending");
+    if (!request) return res.status(404).json({ error: "Request not found." });
+    request.status = "declined"; request.declinedAt = new Date().toISOString();
+    dropFriendRequestNotifications(req.db, req.user.id, request.id);
+    await saveState(req.db);
+    res.json({ ok: true });
+  } catch (error) { next(error); }
+});
+app.post("/api/friends/requests/:requestId/accept", auth, async (req, res, next) => { try { const request = req.db.friendRequests.find(r => r.id === req.params.requestId && r.toUserId === req.user.id && r.status === "pending"); if (!request) return res.status(404).json({ error: "Request not found." }); request.status = "accepted"; request.acceptedAt = new Date().toISOString(); const room = getOrCreateDirectRoom(req.db, request.fromUserId, request.toUserId); dropFriendRequestNotifications(req.db, req.user.id, request.id); await saveState(req.db);
   await notifyUsers({ io: req.app.locals.io, db: req.db, userIds: [request.fromUserId], build: uid => { const { messages, members, ...lite } = roomForClient(req.db, room, uid, { withMessages: false }); return { kind: "friend_accept", title: "Friend request accepted", body: `${req.user.name} accepted your request`, tag: `friend-${request.id}`, roomId: room.id, room: lite }; } }).catch(console.error);
   res.json({ room: roomForClient(req.db, room, req.user.id) }); } catch (error) { next(error); } });
-app.get("/api/posts", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || (friends.has(p.userId) && (!Array.isArray(p.audience) || p.audience.includes(req.user.id)))).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }); });
+app.get("/api/posts", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ posts: req.db.posts.filter(p => p.userId === req.user.id || (friends.has(p.userId) && audienceAllows(p, req.user.id))).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(req.db, p, req.user.id)) }); });
 app.post("/api/posts", auth, async (req, res, next) => {
   try {
     const text = String(req.body?.text || "").trim().slice(0, 2000);
@@ -488,9 +539,10 @@ app.post("/api/posts", auth, async (req, res, next) => {
     if (videoTooLong(media, req.body?.duration)) return res.status(400).json({ error: `Videos can be up to ${MAX_VIDEO_SEC} seconds.` });
     const aud = readAudience(req.db, req.user.id, req.body?.audience);
     if (aud.error) return res.status(400).json({ error: aud.error });
-    const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, audience: aud.audience, duration: media ? cleanDuration("post", media, req.body?.duration) : null, music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), createdAt: new Date().toISOString() };
+    const post = { id: id("post_"), userId: req.user.id, userName: req.user.name, text, media, audience: aud.audience, duration: media ? cleanDuration("post", media, req.body?.duration) : null, music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), mentions: cleanMentions(req.db, req.user.id, req.body?.mentions, text), createdAt: new Date().toISOString() };
     req.db.posts.push(post);
     await saveState(req.db);
+    await notifyMentioned(req, post, "post_mention"); // before responding: serverless hosts can freeze right after
     res.json({ post: postForClient(req.db, post, req.user.id) });
   } catch (error) { next(error); }
 });
@@ -650,17 +702,17 @@ function purgeExpiredStories(db) {
   const gone = db.stories.filter(s => s.expiresAt <= now);
   if (!gone.length) return 0;
   db.stories = db.stories.filter(s => s.expiresAt > now);
-  for (const s of gone) deleteMedia(s.userId, s.media);
+  for (const s of gone) releaseMedia(db, s.mediaOwnerId || s.userId, s.media);
   return gone.length;
 }
 function storyForClient(db, story, viewerId) {
   const author = db.users.find(u => u.id === story.userId);
   const viewers = story.viewers || [];
-  const { viewers: _v, ...rest } = story;
+  const { viewers: _v, mediaOwnerId: _o, ...rest } = story;
   const audienceInfo = viewerId && story.userId === viewerId ? { audience: Array.isArray(story.audience) ? story.audience : null, audienceCount: Array.isArray(story.audience) ? story.audience.length : null } : { audience: undefined };
-  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, userAvatarThumbUrl: author ? avatarThumb(author.avatarUrl) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined };
+  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, userAvatarThumbUrl: author ? avatarThumb(author.avatarUrl) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined, mentionUsers: mentionUsers(db, story), canReshare: story.userId !== viewerId && (story.mentions || []).includes(viewerId) && !(db.stories || []).some(x => x.userId === viewerId && x.expiresAt > Date.now() && x.sharedFrom && x.sharedFrom.storyId === story.id) };
 }
-app.get("/api/stories", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || (friends.has(s.userId) && (!Array.isArray(s.audience) || s.audience.includes(req.user.id))))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }); });
+app.get("/api/stories", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || (friends.has(s.userId) && audienceAllows(s, req.user.id)))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }); });
 app.post("/api/stories", auth, async (req, res, next) => {
   try {
     const text = String(req.body?.text || "").trim().slice(0, 500);
@@ -669,11 +721,12 @@ app.post("/api/stories", auth, async (req, res, next) => {
     if (videoTooLong(media, req.body?.duration)) return res.status(400).json({ error: `Videos can be up to ${MAX_VIDEO_SEC} seconds.` });
     const aud = readAudience(req.db, req.user.id, req.body?.audience);
     if (aud.error) return res.status(400).json({ error: aud.error });
-    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, audience: aud.audience, duration: cleanDuration("story", media, req.body?.duration), music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
+    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, audience: aud.audience, duration: cleanDuration("story", media, req.body?.duration), music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), mentions: cleanMentions(req.db, req.user.id, req.body?.mentions, text), viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
     // Expired stories are removed for good whenever a new one is saved.
     purgeExpiredStories(req.db);
     req.db.stories.push(story);
     await saveState(req.db);
+    await notifyMentioned(req, story, "story_mention");
     res.json({ story: storyForClient(req.db, story, req.user.id) });
   } catch (error) { next(error); }
 });
@@ -693,8 +746,24 @@ app.delete("/api/stories/:storyId", auth, async (req, res, next) => {
     if (story.userId !== req.user.id) return res.status(403).json({ error: "You can only delete your own stories." });
     req.db.stories = req.db.stories.filter(s => s.id !== story.id);
     await saveState(req.db);
-    deleteMedia(req.user.id, story.media);
+    releaseMedia(req.db, story.mediaOwnerId || story.userId, story.media);
     res.json({ ok: true });
+  } catch (error) { next(error); }
+});
+// "Add to your story": someone who was mentioned in a story can put it on their own story.
+// The copy shares the original's file (see releaseMedia) and credits the original author.
+app.post("/api/stories/:storyId/reshare", auth, async (req, res, next) => {
+  try {
+    const orig = req.db.stories.find(s => s.id === req.params.storyId && s.expiresAt > Date.now());
+    if (!orig || orig.userId === req.user.id || !(orig.mentions || []).includes(req.user.id) || !connected(req.db, req.user.id, orig.userId)) return res.status(404).json({ error: "This story is no longer available." });
+    if (req.db.stories.some(x => x.userId === req.user.id && x.expiresAt > Date.now() && x.sharedFrom && x.sharedFrom.storyId === orig.id)) return res.status(409).json({ error: "You already added this to your story." });
+    purgeExpiredStories(req.db);
+    const copy = v => (v == null ? v : JSON.parse(JSON.stringify(v)));
+    const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text: orig.text || "", media: copy(orig.media), mediaOwnerId: orig.mediaOwnerId || orig.userId, audience: null, duration: orig.duration, music: copy(orig.music), overlays: copy(orig.overlays) || [], mentions: [orig.userId], sharedFrom: { storyId: orig.id, userId: orig.userId, userName: orig.userName }, viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
+    req.db.stories.push(story);
+    for (const n of req.db.notifications || []) if (n.userId === req.user.id && n.storyId === orig.id) n.actioned = true;
+    await saveState(req.db);
+    res.json({ story: storyForClient(req.db, story, req.user.id) });
   } catch (error) { next(error); }
 });
 
