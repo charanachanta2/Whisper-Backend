@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const { enableCache, flushNow } = require("./store");
 // Long-running server: keep app state in memory and write it to MongoDB in batches.
 enableCache();
-const { app, helpers } = require("./app");
+const { app, videos, helpers } = require("./app");
 const { notifyUsers, previewFor } = require("./notify");
 
 const PORT = process.env.PORT || 3000;
@@ -151,4 +151,12 @@ async function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
-server.listen(PORT, "0.0.0.0", () => console.log(`Music Chat backend listening on ${PORT}`));
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Music Chat backend listening on ${PORT}`);
+  videos.resumePending(); // finish compressing any videos left over from before a restart
+  // Expired stories (24h) are removed -- and their files deleted from storage -- every hour, not just when someone posts a new story.
+  setInterval(async () => {
+    try { const db = await helpers.loadState(); if (helpers.purgeExpiredStories(db)) await helpers.saveState(db); }
+    catch (error) { console.error("[stories] cleanup failed:", error.message); }
+  }, 60 * 60 * 1000).unref();
+});

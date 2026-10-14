@@ -8,6 +8,8 @@ const compression = require("compression");
 const { loadState, saveState, avatarsCollection, findInvite, consumeInvite } = require("./store");
 const { notifyUsers, pushPublicKey, isPushEnabled } = require("./notify");
 const { Binary } = require("mongodb");
+const storage = require("./storage");
+const { optimizeImage, optimizeAvatar, makeAvatarThumb, createVideoCompressor, extFor } = require("./media");
 
 const app = express();
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "*";
@@ -22,6 +24,35 @@ const INVITE_SECRET = process.env.INVITE_SECRET || "change-me-invite-secret";
 // Storage before relying on it for anything you can't afford to lose.
 const UPLOADS_DIR = path.join(__dirname, "..", "data", "uploads");
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// Compresses uploaded videos in the background (see media.js); photos are optimised during upload.
+// With Cloudflare R2 (see storage.js) files live in the bucket and UPLOADS_DIR is not used for media;
+// videos are only kept briefly in TMP_DIR while ffmpeg works on them.
+const TMP_DIR = path.join(__dirname, "..", "data", "tmp-video");
+const remoteKeys = new Map(); // video file name -> its key in R2
+let videos;
+if (storage.enabled) {
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+  videos = createVideoCompressor(TMP_DIR, {
+    remote: {
+      // Replaces the uploaded original with the compressed version under the same key (so the link doesn't change).
+      upload: async (name, file) => {
+        const key = remoteKeys.get(name);
+        remoteKeys.delete(name);
+        if (!key || storage.isDeleted(key)) return;
+        await storage.put(key, fs.createReadStream(file), "video/mp4", "public, max-age=31536000, immutable", fs.statSync(file).size);
+      },
+    },
+  });
+} else {
+  videos = createVideoCompressor(UPLOADS_DIR);
+}
+// Removes a deleted post/story's files from R2 -- only files in the owner's own folder, whatever the client claims.
+function deleteMedia(userId, media) {
+  if (!storage.enabled || !media || typeof media !== "object") return;
+  const own = `uploads/${userId}/`;
+  const keys = [media.url, media.thumbUrl].map(storage.keyFromUrl).filter(k => k && k.startsWith(own));
+  storage.remove(keys).catch(() => {});
+}
 const MAX_UPLOAD_BYTES = 80 * 1024 * 1024; // 80MB, generous enough for a short video clip
 const ALLOWED_UPLOAD_PREFIXES = ["image/", "video/", "audio/"];
 const upload = multer({
@@ -70,8 +101,24 @@ app.use((req, res, next) => {
   if (req.path === "/api/upload" || req.path === "/api/me/avatar") return next();
   express.json({ limit: "2mb" })(req, res, next);
 });
-// Filenames are unique and never change, so browsers can cache them hard.
-app.use("/uploads", express.static(UPLOADS_DIR, { maxAge: "7d", immutable: true }));
+// Videos: once a compressed copy exists it is served in place of the original
+// (same URL, so nothing stored in chats/posts needs to change).
+app.get("/uploads/:file", (req, res, next) => {
+  const name = path.basename(String(req.params.file));
+  if (!videos.isVideoFile(name)) return next();
+  const compressed = videos.compressedFor(name);
+  if (!compressed) return next();
+  res.set("Cache-Control", "public, max-age=604800, immutable");
+  res.type("video/mp4");
+  res.sendFile(compressed, err => { if (err && !res.headersSent) next(); });
+});
+// Filenames are unique and never change, so browsers can cache them hard --
+// except a video that's still waiting to be compressed (its bytes will change).
+app.use("/uploads", express.static(UPLOADS_DIR, {
+  maxAge: "7d",
+  immutable: true,
+  setHeaders: (res, filePath) => { if (videos.isVideoFile(filePath) && videos.isPending(path.basename(filePath))) res.setHeader("Cache-Control", "public, max-age=60"); },
+}));
 
 function id(prefix = "") { return prefix + crypto.randomBytes(12).toString("hex"); }
 // Async scrypt: the Sync version blocks the whole server (every request and
@@ -85,7 +132,9 @@ async function verifyPassword(password, user) {
 }
 function sign(payload) { const body = Buffer.from(JSON.stringify(payload)).toString("base64url"); const sig = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url"); return `${body}.${sig}`; }
 function verify(token) { if (!token) return null; try { const [body, sig] = token.split("."); const expected = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url"); if (!sig || sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; const data = JSON.parse(Buffer.from(body, "base64url").toString()); return data.exp > Date.now() ? data : null; } catch (_) { return null; } }
-function publicUser(user) { return { id: user.id, username: user.username, name: user.name, bio: user.bio || "", avatarUrl: user.avatarUrl || null }; }
+// Small (128px) version of one of our own avatar URLs -- loaded for lists, feeds and chat headers instead of the full photo.
+function avatarThumb(url) { return url && /\/avatars\/[^/?]+/.test(url) ? url.replace(/(\/avatars\/[^/?]+)/, "$1/thumb") : null; }
+function publicUser(user) { return { id: user.id, username: user.username, name: user.name, bio: user.bio || "", avatarUrl: user.avatarUrl || null, avatarThumbUrl: avatarThumb(user.avatarUrl) }; }
 // Posts store userName at creation time (so a feed still reads sensibly if
 // the author is later removed), but the avatar should always reflect the
 // author's *current* profile photo -- otherwise updating your avatar would
@@ -96,12 +145,12 @@ function postForClient(db, post, viewerId) {
   const likes = post.likes || [];
   const comments = (post.comments || []).map(c => {
     const cu = db.users.find(u => u.id === c.userId);
-    return { ...c, userName: cu ? cu.name : c.userName, userAvatarUrl: cu ? (cu.avatarUrl || null) : null };
+    return { ...c, userName: cu ? cu.name : c.userName, userAvatarUrl: cu ? (cu.avatarUrl || null) : null, userAvatarThumbUrl: cu ? avatarThumb(cu.avatarUrl) : null };
   });
   const { likes: _l, comments: _c, audience, ...rest } = post;
   // Only the author is told who a post is limited to.
   const audienceInfo = viewerId && post.userId === viewerId ? { audience: Array.isArray(audience) ? audience : null, audienceCount: Array.isArray(audience) ? audience.length : null } : {};
-  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, likeCount: likes.length, likedByMe: viewerId ? likes.includes(viewerId) : false, commentCount: comments.length, comments };
+  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, userAvatarThumbUrl: author ? avatarThumb(author.avatarUrl) : null, likeCount: likes.length, likedByMe: viewerId ? likes.includes(viewerId) : false, commentCount: comments.length, comments };
 }
 // A post is visible to its author and their accepted friends -- likes and
 // comments follow the same rule.
@@ -184,8 +233,24 @@ app.get("/avatars/:userId", async (req, res, next) => {
     res.send(Buffer.from(doc.data.buffer));
   } catch (error) { next(error); }
 });
+app.get("/avatars/:userId/thumb", async (req, res, next) => {
+  try {
+    const col = await avatarsCollection();
+    const doc = await col.findOne({ _id: String(req.params.userId) });
+    if (!doc || !doc.data) return res.status(404).end();
+    let thumb = doc.thumb ? Buffer.from(doc.thumb.buffer) : null;
+    if (!thumb) {
+      // Photos saved before thumbnails existed: make one now and remember it.
+      const made = await makeAvatarThumb(Buffer.from(doc.data.buffer));
+      if (made) { thumb = made; col.updateOne({ _id: doc._id }, { $set: { thumb: new Binary(made), thumbMime: "image/webp" } }).catch(() => {}); }
+    }
+    res.set("Content-Type", thumb ? (doc.thumb ? doc.mime : "image/webp") || "image/webp" : doc.mime || "image/jpeg");
+    res.set("Cache-Control", "public, max-age=604800, immutable");
+    res.send(thumb || Buffer.from(doc.data.buffer));
+  } catch (error) { next(error); }
+});
 app.get("/", (req, res) => res.json({ service: "music-chat-api", status: "online" }));
-app.get("/health", async (req, res, next) => { try { await loadState(); res.json({ ok: true, service: "music-chat-server", storage: "mongodb" }); } catch (error) { next(error); } });
+app.get("/health", async (req, res, next) => { try { await loadState(); res.json({ ok: true, service: "music-chat-server", storage: "mongodb", media: storage.enabled ? "r2" : "disk" }); } catch (error) { next(error); } });
 app.get("/api/me", auth, (req, res) => res.json({ user: publicUser(req.user) }));
 // Lets someone update their own display name, bio, and profile photo.
 // Deliberately narrow: only these three fields, and only for req.user --
@@ -218,9 +283,13 @@ app.post("/api/me/avatar", auth, express.json({ limit: "15mb" }), async (req, re
     // redeploy/restart (Render, Vercel), which used to leave avatarUrl
     // pointing at a file that no longer existed -- a blank profile photo.
     const updatedAt = Date.now();
+    // 512px + 128px WebP versions (a few KB each); falls back to the original if conversion isn't possible.
+    const opt = await optimizeAvatar(buffer);
     await (await avatarsCollection()).replaceOne(
       { _id: req.user.id },
-      { _id: req.user.id, mime: String(type), data: new Binary(buffer), updatedAt },
+      opt
+        ? { _id: req.user.id, mime: opt.mime, data: new Binary(opt.main), thumb: new Binary(opt.thumb), updatedAt }
+        : { _id: req.user.id, mime: String(type), data: new Binary(buffer), updatedAt },
       { upsert: true },
     );
     req.user.avatarUrl = `${publicBaseUrl(req)}/avatars/${req.user.id}?v=${updatedAt}`;
@@ -248,6 +317,44 @@ app.post("/api/me/avatar", auth, express.json({ limit: "15mb" }), async (req, re
 // middleware below) rather than raised globally, since a base64 video can
 // be ~1.4x its raw byte size.
 const uploadJsonLimit = express.json({ limit: "110mb" });
+// Saves one uploaded file, shrinking it on the way in (see media.js), and
+// returns what the app needs to show it.
+async function storeUpload(req, buffer, fileName, mimeType, userId) {
+  const type = mimeType || "application/octet-stream";
+  const stem = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}`;
+  let ext = extFor(fileName, type) || (type.startsWith("video/") ? ".mp4" : "");
+  let out = buffer, outType = type, displayName = fileName, width, height, thumb = null;
+  if (type.startsWith("image/")) {
+    const opt = await optimizeImage(buffer, type);
+    if (opt) {
+      out = opt.buffer; outType = opt.mimeType; width = opt.width; height = opt.height; thumb = opt.thumb;
+      if (opt.ext) { ext = opt.ext; if (fileName) displayName = fileName.replace(/\.[^./\\]+$/, "") + opt.ext; }
+    }
+  }
+  const filename = `${stem}${ext}`;
+  const isVideo = type.startsWith("video/");
+  let url, thumbUrl;
+  if (storage.enabled) {
+    // Cloudflare R2. Photos/audio never change, so they're cached for a year; a video may be swapped for its compressed version soon, so it gets a shorter cache.
+    const folder = `uploads/${userId}/`;
+    const cache = isVideo ? "public, max-age=3600" : undefined;
+    url = await storage.put(folder + filename, out, outType, cache);
+    if (thumb) thumbUrl = await storage.put(`${folder}${stem}-t.webp`, thumb, "image/webp");
+    if (isVideo && videos.available) {
+      remoteKeys.set(filename, folder + filename);
+      await fs.promises.writeFile(path.join(TMP_DIR, filename), out);
+      videos.enqueue(filename); // compressed in the background, then replaced in R2
+    }
+  } else {
+    // Local disk (development). Async write: writeFileSync would freeze the whole server while a large video is saved.
+    await fs.promises.mkdir(UPLOADS_DIR, { recursive: true });
+    await fs.promises.writeFile(path.join(UPLOADS_DIR, filename), out);
+    url = `${publicBaseUrl(req)}/uploads/${filename}`;
+    if (thumb) { await fs.promises.writeFile(path.join(UPLOADS_DIR, `${stem}-t.webp`), thumb); thumbUrl = `${publicBaseUrl(req)}/uploads/${stem}-t.webp`; }
+    if (isVideo) videos.enqueue(filename);
+  }
+  return { url, thumbUrl, mimeType: outType, fileName: displayName || filename, size: out.length, width, height };
+}
 app.post("/api/upload", auth, uploadJsonLimit, async (req, res) => {
   const contentType = req.headers["content-type"] || "";
   if (contentType.startsWith("application/json")) {
@@ -259,31 +366,24 @@ app.post("/api/upload", auth, uploadJsonLimit, async (req, res) => {
       if (!okType) return res.status(400).json({ error: "Unsupported file type." });
       const buffer = Buffer.from(data, "base64");
       if (buffer.length > MAX_UPLOAD_BYTES) return res.status(400).json({ error: "That file is too large (max 80MB)." });
-      const ext = path.extname(fileName || "").slice(0, 10);
-      const filename = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
-      // Async write: writeFileSync would freeze the whole server while a large video is saved.
-      await fs.promises.mkdir(UPLOADS_DIR, { recursive: true });
-      await fs.promises.writeFile(path.join(UPLOADS_DIR, filename), buffer);
-      return res.json({
-        url: `${publicBaseUrl(req)}/uploads/${filename}`,
-        mimeType: type,
-        fileName: fileName || filename,
-        size: buffer.length,
-      });
+      return res.json(await storeUpload(req, buffer, fileName, type, req.user.id));
     } catch (error) {
       console.error("[upload] failed:", error);
       return res.status(500).json({ error: "Upload failed on the server." });
     }
   }
-  upload.single("file")(req, res, (err) => {
+  upload.single("file")(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.message === "File too large" ? "That file is too large (max 80MB)." : err.message || "Upload failed." });
     if (!req.file) return res.status(400).json({ error: "No file received." });
-    res.json({
-      url: `${publicBaseUrl(req)}/uploads/${req.file.filename}`,
-      mimeType: req.file.mimetype,
-      fileName: req.file.originalname || req.file.filename,
-      size: req.file.size,
-    });
+    try {
+      // Older app builds: same treatment, read back from the temp file multer wrote.
+      const buffer = await fs.promises.readFile(req.file.path);
+      await fs.promises.rm(req.file.path, { force: true });
+      res.json(await storeUpload(req, buffer, req.file.originalname, req.file.mimetype, req.user.id));
+    } catch (error) {
+      console.error("[upload] failed:", error);
+      res.status(500).json({ error: "Upload failed on the server." });
+    }
   });
 });
 
@@ -344,7 +444,7 @@ function friendIds(db, userId) {
   for (const r of db.friendRequests) if (r.status === "accepted") { if (r.fromUserId === userId) set.add(r.toUserId); else if (r.toUserId === userId) set.add(r.fromUserId); }
   return set;
 }
-function socialUser(user) { return { id: user.id, username: user.username, name: user.name }; }
+function socialUser(user) { return { id: user.id, username: user.username, name: user.name, avatarUrl: user.avatarUrl || null, avatarThumbUrl: avatarThumb(user.avatarUrl) }; }
 
 // Opens (or creates) the 1:1 chat with an existing friend. This is what
 // lets someone message a friend directly from search/discover instead of
@@ -409,6 +509,7 @@ app.put("/api/posts/:postId", auth, async (req, res, next) => {
       if (aud.error) return res.status(400).json({ error: aud.error });
       post.audience = aud.audience;
     }
+    if (post.media && post.media.url && (!media || media.url !== post.media.url)) deleteMedia(req.user.id, post.media);
     post.text = text; post.media = media; post.editedAt = new Date().toISOString();
     await saveState(req.db);
     res.json({ post: postForClient(req.db, post, req.user.id) });
@@ -421,6 +522,7 @@ app.delete("/api/posts/:postId", auth, async (req, res, next) => {
     if (post.userId !== req.user.id) return res.status(403).json({ error: "You can only delete your own posts." });
     req.db.posts = req.db.posts.filter(p => p.id !== req.params.postId);
     await saveState(req.db);
+    deleteMedia(req.user.id, post.media);
     res.json({ ok: true });
   } catch (error) { next(error); }
 });
@@ -542,12 +644,21 @@ app.delete("/api/posts/:postId/comments/:commentId", auth, async (req, res, next
 });
 // --- Stories (disappear 24 hours after posting) ---
 const STORY_TTL_MS = 24 * 3600 * 1000;
+// Drops stories older than 24 hours and deletes their files from R2 (keeps storage small). Returns how many were removed.
+function purgeExpiredStories(db) {
+  const now = Date.now();
+  const gone = db.stories.filter(s => s.expiresAt <= now);
+  if (!gone.length) return 0;
+  db.stories = db.stories.filter(s => s.expiresAt > now);
+  for (const s of gone) deleteMedia(s.userId, s.media);
+  return gone.length;
+}
 function storyForClient(db, story, viewerId) {
   const author = db.users.find(u => u.id === story.userId);
   const viewers = story.viewers || [];
   const { viewers: _v, ...rest } = story;
   const audienceInfo = viewerId && story.userId === viewerId ? { audience: Array.isArray(story.audience) ? story.audience : null, audienceCount: Array.isArray(story.audience) ? story.audience.length : null } : { audience: undefined };
-  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined };
+  return { ...rest, ...audienceInfo, userAvatarUrl: author ? (author.avatarUrl || null) : null, userAvatarThumbUrl: author ? avatarThumb(author.avatarUrl) : null, viewedByMe: story.userId === viewerId || viewers.includes(viewerId), viewCount: story.userId === viewerId ? viewers.length : undefined };
 }
 app.get("/api/stories", auth, (req, res) => { const friends = friendIds(req.db, req.user.id); res.json({ stories: req.db.stories.filter(s => s.expiresAt > Date.now() && (s.userId === req.user.id || (friends.has(s.userId) && (!Array.isArray(s.audience) || s.audience.includes(req.user.id))))).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(s => storyForClient(req.db, s, req.user.id)) }); });
 app.post("/api/stories", auth, async (req, res, next) => {
@@ -560,7 +671,7 @@ app.post("/api/stories", auth, async (req, res, next) => {
     if (aud.error) return res.status(400).json({ error: aud.error });
     const story = { id: id("story_"), userId: req.user.id, userName: req.user.name, text, media, audience: aud.audience, duration: cleanDuration("story", media, req.body?.duration), music: cleanMusic(req.body?.music), overlays: cleanOverlays(req.body?.overlays), viewers: [], createdAt: new Date().toISOString(), expiresAt: Date.now() + STORY_TTL_MS };
     // Expired stories are removed for good whenever a new one is saved.
-    req.db.stories = req.db.stories.filter(s => s.expiresAt > Date.now());
+    purgeExpiredStories(req.db);
     req.db.stories.push(story);
     await saveState(req.db);
     res.json({ story: storyForClient(req.db, story, req.user.id) });
@@ -582,6 +693,7 @@ app.delete("/api/stories/:storyId", auth, async (req, res, next) => {
     if (story.userId !== req.user.id) return res.status(403).json({ error: "You can only delete your own stories." });
     req.db.stories = req.db.stories.filter(s => s.id !== story.id);
     await saveState(req.db);
+    deleteMedia(req.user.id, story.media);
     res.json({ ok: true });
   } catch (error) { next(error); }
 });
@@ -645,4 +757,4 @@ app.post("/api/push/unsubscribe", auth, async (req, res, next) => {
 
 app.use((error, req, res, next) => { console.error(error); res.status(500).json({ error: "Server storage is unavailable. Please try again." }); });
 
-module.exports = { app, helpers: { verify, roomForClient, loadState, saveState } };
+module.exports = { app, videos, helpers: { verify, roomForClient, loadState, saveState, purgeExpiredStories } };

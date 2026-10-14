@@ -1,167 +1,228 @@
-const crypto = require("crypto");
+// Media pipeline: makes uploaded photos and videos much smaller without a
+// visible drop in quality.
+//
+//  * Photos  -> re-encoded as WebP (visually the same at q82, usually 30-60%
+//               smaller than the JPEG the phone sends), capped at 2048px on the
+//               long edge, camera metadata (incl. GPS location) removed, plus a
+//               small thumbnail for chat bubbles / lists. Done instantly while
+//               the upload request is open.
+//  * Videos  -> saved as-is so the upload returns immediately, then compressed
+//               in the background with ffmpeg (H.264 + AAC, max 1080p, CRF 23,
+//               "faststart" for instant playback). One at a time, at low CPU
+//               priority, so chat stays responsive. Once done, /uploads/<file>
+//               transparently serves the small version and the original is
+//               deleted. If the result isn't clearly smaller (or the video is
+//               HDR, which would wash out when converted) the original is kept.
+//
+// Tuning (all optional env vars): IMAGE_MAX_PX, IMAGE_QUALITY, VIDEO_COMPRESSION=off,
+// VIDEO_MAX_PX, VIDEO_CRF, VIDEO_PRESET, VIDEO_THREADS, VIDEO_CONCURRENCY, FFMPEG_PATH.
 const fs = require("fs");
 const path = require("path");
-const { pipeline } = require("stream/promises");
-const { Readable } = require("stream");
-const sharp = require("sharp");
-const { getStore } = require("./store");
+const { spawn, spawnSync } = require("child_process");
 
-// Everything uploaded goes through here. The big wins for "uploads feel slow"
-// and "profile picture won't load":
-//  * Photos are shrunk server-side (auto-rotated, max 1600px, WebP) so a 6MB
-//    camera shot becomes ~150-300KB, and a small thumbnail is made too.
-//  * Avatars become a 512px square (+128px thumb), usually 10-30KB.
-//  * Files are stored in MongoDB GridFS, so they survive restarts/redeploys.
-//    (They used to be written to local disk, which Render wipes on every
-//    deploy and Vercel doesn't allow writing to at all -- hence broken
-//    pictures.)
-//  * Files are served with long-lived cache headers + HTTP Range support, so
-//    images are fetched once per device and videos can seek/stream.
-
-const MAX_UPLOAD_BYTES = 80 * 1024 * 1024; // videos / audio / files
-const MAX_IMAGE_INPUT_BYTES = 30 * 1024 * 1024;
-const ALLOWED_UPLOAD_PREFIXES = ["image/", "video/", "audio/"];
-const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".gif", ".avif"]);
-
-const PRESETS = {
-  avatar: { main: { size: 512, fit: "cover", quality: 82 }, thumb: { size: 128, fit: "cover", quality: 75 } },
-  photo: { main: { size: 1600, fit: "inside", quality: 80 }, thumb: { size: 400, fit: "inside", quality: 70 } },
-};
-
-function isAllowedType(mimeType) {
-  const type = mimeType || "application/octet-stream";
-  return ALLOWED_UPLOAD_PREFIXES.some(p => type.startsWith(p)) || type === "application/octet-stream";
+let sharp = null;
+try {
+  sharp = require("sharp");
+  sharp.cache(false);
+  sharp.concurrency(Number(process.env.SHARP_THREADS) || 2);
+} catch (error) {
+  console.warn("[media] sharp is not installed -- photos will be stored as uploaded.");
 }
 
-function looksLikeImage(mimeType, fileName) {
-  if ((mimeType || "").startsWith("image/")) return true;
-  return (mimeType || "application/octet-stream") === "application/octet-stream" && IMAGE_EXT.has(path.extname(fileName || "").toLowerCase());
+const IMAGE_MAX_PX = Number(process.env.IMAGE_MAX_PX) || 2048;
+const IMAGE_QUALITY = Number(process.env.IMAGE_QUALITY) || 82;
+const THUMB_PX = 480;
+const VIDEO_ON = String(process.env.VIDEO_COMPRESSION || "on").toLowerCase() !== "off" && !process.env.VERCEL; // serverless hosts can't run background jobs
+const VIDEO_MAX_PX = Number(process.env.VIDEO_MAX_PX) || 1920; // long edge: 1920 = "1080p"
+const VIDEO_CRF = String(process.env.VIDEO_CRF || 23);
+const VIDEO_PRESET = process.env.VIDEO_PRESET || "veryfast";
+const VIDEO_THREADS = String(process.env.VIDEO_THREADS || 2);
+const VIDEO_CONCURRENCY = Math.max(1, Number(process.env.VIDEO_CONCURRENCY) || 1);
+const VIDEO_TIMEOUT_MS = 15 * 60 * 1000;
+const KEEP_IF_SAVING_BELOW = 0.08; // keep the original unless the new file is at least 8% smaller
+
+let ffmpegPath = process.env.FFMPEG_PATH || null;
+if (!ffmpegPath) { try { ffmpegPath = require("ffmpeg-static"); } catch (_) { ffmpegPath = null; } }
+if (!ffmpegPath) {
+  const probe = spawnSync("ffmpeg", ["-version"]);
+  if (!probe.error && probe.status === 0) ffmpegPath = "ffmpeg";
 }
+if (VIDEO_ON && !ffmpegPath) console.warn("[media] ffmpeg not found -- videos will be stored as uploaded.");
+const hasNice = !spawnSync("nice", ["-n", "0", "true"]).error;
 
-const randomName = () => `${Date.now()}-${crypto.randomBytes(8).toString("hex")}`;
+const VIDEO_EXTS = new Set([".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".3gp", ".mpg", ".mpeg"]);
+const MIME_EXT = { "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/heic": ".heic", "image/heif": ".heif", "image/gif": ".gif", "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm", "video/x-matroska": ".mkv", "video/3gpp": ".3gp", "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/aac": ".aac", "audio/wav": ".wav", "audio/webm": ".webm", "audio/ogg": ".ogg" };
 
-async function putBuffer(bucket, filename, buffer, contentType) {
-  await pipeline(Readable.from([buffer]), bucket.openUploadStream(filename, { metadata: { contentType } }));
+function extFor(fileName, mime) {
+  const fromName = path.extname(fileName || "").toLowerCase().replace(/[^.a-z0-9]/g, "").slice(0, 10);
+  return fromName || MIME_EXT[String(mime || "").toLowerCase()] || "";
 }
+const isVideoFile = (name) => VIDEO_EXTS.has(path.extname(name).toLowerCase());
 
-async function resize(input, { size, fit, quality }) {
-  const { data, info } = await sharp(input, { failOn: "none" })
-    .rotate() // honour phone camera orientation, then drop the EXIF
-    .resize({ width: size, height: size, fit, withoutEnlargement: fit === "inside" })
-    .webp({ quality })
-    .toBuffer({ resolveWithObject: true });
-  return { data, info };
-}
-
-class UploadError extends Error {
-  constructor(message, status = 400) { super(message); this.status = status; }
-}
-
-/**
- * Stores an upload and returns what the client needs.
- * source: { buffer } or { filePath } (a temp file written by multer).
- * Returns { url, thumbUrl, mimeType, fileName, size, width, height }.
- */
-async function storeUpload({ buffer, filePath, mimeType, fileName, purpose, baseUrl }) {
-  if (!isAllowedType(mimeType)) throw new UploadError("Unsupported file type.");
-  const { bucket } = await getStore();
-  const base = randomName();
-
-  if (looksLikeImage(mimeType, fileName)) {
-    const input = buffer || (await fs.promises.readFile(filePath));
-    if (input.length > MAX_IMAGE_INPUT_BYTES) throw new UploadError("That image is too large (max 30MB).");
-    const preset = PRESETS[purpose] || PRESETS.photo;
-    const isGif = mimeType === "image/gif" && purpose !== "avatar";
-    let main, thumb;
-    try {
-      // Animated GIFs are kept as-is so they still animate; everything else is optimised.
-      main = isGif ? { data: input, info: await sharp(input, { failOn: "none" }).metadata() } : await resize(input, preset.main);
-      thumb = await resize(input, preset.thumb);
-    } catch (_) {
-      throw new UploadError("We couldn't read that image. Try a JPG or PNG.", 415);
-    }
-    const ext = isGif ? ".gif" : ".webp";
-    const mainName = `${base}${ext}`;
-    const thumbName = `${base}-t.webp`;
-    await Promise.all([
-      putBuffer(bucket, mainName, main.data, isGif ? "image/gif" : "image/webp"),
-      putBuffer(bucket, thumbName, thumb.data, "image/webp"),
-    ]);
+// ---------------------------------------------------------------- photos
+// Returns { buffer, mimeType, ext, width, height, thumb } or null if the buffer
+// can't/shouldn't be converted (GIF, SVG, unreadable data, sharp missing).
+async function optimizeImage(buffer, mime) {
+  const type = String(mime || "").toLowerCase();
+  if (!sharp || type === "image/gif" || type === "image/svg+xml") return null;
+  try {
+    const base = () => sharp(buffer, { failOn: "none" }).rotate(); // .rotate() applies the camera's orientation, then metadata is dropped
+    const main = await base()
+      .resize({ width: IMAGE_MAX_PX, height: IMAGE_MAX_PX, fit: "inside", withoutEnlargement: true })
+      .webp({ quality: IMAGE_QUALITY, effort: 4 })
+      .toBuffer({ resolveWithObject: true });
+    const thumb = await base()
+      .resize({ width: THUMB_PX, height: THUMB_PX, fit: "inside", withoutEnlargement: true })
+      .webp({ quality: 70, effort: 3 })
+      .toBuffer();
+    // Already tiny/optimal? Keep the original bytes (but still return the thumbnail).
+    const keepOriginal = main.data.length >= buffer.length * 0.97 && /^image\/(jpeg|png|webp)$/.test(type);
     return {
-      url: `${baseUrl}/uploads/${mainName}`,
-      thumbUrl: `${baseUrl}/uploads/${thumbName}`,
-      mimeType: isGif ? "image/gif" : "image/webp",
-      fileName: fileName || mainName,
-      size: main.data.length,
-      width: main.info.width || null,
-      height: main.info.height || null,
+      buffer: keepOriginal ? buffer : main.data,
+      mimeType: keepOriginal ? type : "image/webp",
+      ext: keepOriginal ? null : ".webp",
+      width: main.info.width,
+      height: main.info.height,
+      thumb,
     };
+  } catch (error) {
+    console.error("[media] image optimize failed, storing original:", error.message);
+    return null;
+  }
+}
+
+// Profile photos: a 512px picture and a 128px thumbnail, both WebP.
+async function optimizeAvatar(buffer) {
+  if (!sharp) return null;
+  try {
+    const base = () => sharp(buffer, { failOn: "none" }).rotate();
+    const main = await base().resize({ width: 512, height: 512, fit: "cover" }).webp({ quality: 85, effort: 4 }).toBuffer();
+    const thumb = await base().resize({ width: 128, height: 128, fit: "cover" }).webp({ quality: 78, effort: 3 }).toBuffer();
+    return { main, thumb, mime: "image/webp" };
+  } catch (error) {
+    console.error("[media] avatar optimize failed:", error.message);
+    return null;
+  }
+}
+async function makeAvatarThumb(buffer) {
+  if (!sharp) return null;
+  try { return await sharp(buffer, { failOn: "none" }).rotate().resize({ width: 128, height: 128, fit: "cover" }).webp({ quality: 78 }).toBuffer(); }
+  catch (_) { return null; }
+}
+
+// ---------------------------------------------------------------- videos
+// `dir` holds the files being worked on. Without `remote` (local-disk mode) the
+// compressed copy sits next to the original and is served in its place. With
+// `remote` ({ upload(name, filePath) }) the files in `dir` are only temporary:
+// the finished video is handed to remote.upload() (Cloudflare R2) and removed.
+function createVideoCompressor(dir, { remote = null } = {}) {
+  const queue = [];
+  const queued = new Set();
+  let running = 0;
+  const p = (name) => path.join(dir, name);
+  const baseOf = (name) => name.replace(/\.[^.]+$/, "");
+  const exists = (file) => fs.existsSync(file);
+
+  // Compressed copy, if one exists for an uploaded video's filename.
+  function compressedFor(name) {
+    const file = p(`${baseOf(name)}.c.mp4`);
+    return exists(file) ? file : null;
+  }
+  // True while a video is waiting for (or in the middle of) compression.
+  function isPending(name) { return queued.has(name); }
+
+  function ffmpegInfo(file) {
+    return new Promise((resolve) => {
+      const child = spawn(ffmpegPath, ["-hide_banner", "-i", file]);
+      let text = "";
+      child.stderr.on("data", (d) => { if (text.length < 60000) text += d; });
+      child.on("error", () => resolve(""));
+      child.on("close", () => resolve(text));
+    });
   }
 
-  // Video / audio / other: stored untouched (streamed straight from the temp
-  // file when we have one, so a big video never sits fully in memory).
-  const size = buffer ? buffer.length : (await fs.promises.stat(filePath)).size;
-  if (size > MAX_UPLOAD_BYTES) throw new UploadError("That file is too large (max 80MB).");
-  const ext = path.extname(fileName || "").slice(0, 10).replace(/[^\w.]/g, "");
-  const name = `${base}${ext}`;
-  const type = mimeType || "application/octet-stream";
-  const upload = bucket.openUploadStream(name, { metadata: { contentType: type } });
-  await pipeline(buffer ? Readable.from([buffer]) : fs.createReadStream(filePath), upload);
-  return { url: `${baseUrl}/uploads/${name}`, thumbUrl: null, mimeType: type, fileName: fileName || name, size, width: null, height: null };
-}
-
-// Deletes a previously uploaded file (and its thumbnail) given its public URL.
-async function deleteByUrl(url) {
-  try {
-    const match = /\/uploads\/([\w.-]+)$/.exec(String(url || ""));
-    if (!match) return;
-    const { bucket } = await getStore();
-    const names = [match[1]];
-    if (!match[1].includes("-t.")) names.push(match[1].replace(/\.\w+$/, "-t.webp"));
-    for (const name of names) {
-      const file = await bucket.find({ filename: name }).limit(1).next();
-      if (file) await bucket.delete(file._id);
-    }
-  } catch (_) { /* best effort cleanup */ }
-}
-
-// GET /uploads/:name -- streams a stored file with caching + Range support.
-async function serveUpload(req, res, next) {
-  try {
-    const name = req.params.name;
-    if (!/^[\w.-]+$/.test(name)) return next();
-    const { bucket } = await getStore();
-    const file = await bucket.find({ filename: name }).limit(1).next();
-    if (!file) return next(); // fall through to any legacy on-disk file
-    const etag = `"${file._id}"`;
-    res.set({
-      "Content-Type": file.metadata?.contentType || "application/octet-stream",
-      "Cache-Control": "public, max-age=31536000, immutable", // names are unique, so content never changes
-      ETag: etag,
-      "Accept-Ranges": "bytes",
-      "Cross-Origin-Resource-Policy": "cross-origin",
+  function encode(src, out) {
+    return new Promise((resolve, reject) => {
+      const scale = `scale='if(gt(iw,ih),min(${VIDEO_MAX_PX},iw),-2)':'if(gt(iw,ih),-2,min(${VIDEO_MAX_PX},ih))',scale=trunc(iw/2)*2:trunc(ih/2)*2`;
+      const args = ["-y", "-nostdin", "-v", "error", "-i", src, "-map", "0:v:0", "-map", "0:a:0?", "-vf", scale,
+        "-c:v", "libx264", "-preset", VIDEO_PRESET, "-crf", VIDEO_CRF, "-maxrate", "8M", "-bufsize", "16M", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-map_metadata", "-1", "-threads", VIDEO_THREADS, "-f", "mp4", out];
+      const child = hasNice ? spawn("nice", ["-n", "10", ffmpegPath, ...args]) : spawn(ffmpegPath, args);
+      let err = "";
+      child.stderr.on("data", (d) => { if (err.length < 4000) err += d; });
+      const timer = setTimeout(() => child.kill("SIGKILL"), VIDEO_TIMEOUT_MS);
+      child.on("error", (e) => { clearTimeout(timer); reject(e); });
+      child.on("close", (code) => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(err.trim().split("\n").pop() || `ffmpeg exited with ${code}`)); });
     });
-    if (req.headers["if-none-match"] === etag) return res.status(304).end();
+  }
 
-    let start = 0;
-    let end = file.length - 1;
-    const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || "");
-    if (range && (range[1] || range[2])) {
-      if (range[1]) { start = Number(range[1]); if (range[2]) end = Math.min(Number(range[2]), end); }
-      else { start = Math.max(file.length - Number(range[2]), 0); } // "last N bytes"
-      if (start > end || start >= file.length) {
-        res.set("Content-Range", `bytes */${file.length}`);
-        return res.status(416).end();
+  async function run(name) {
+    const src = p(name);
+    const base = baseOf(name);
+    const tmp = p(`${base}.tmp.mp4`);
+    const done = p(`${base}.c.mp4`);
+    const skip = p(`${base}.skip`);
+    // Nothing more to do for this video: keep the original as it is.
+    const keepOriginal = (reason) => {
+      if (remote) fs.rmSync(src, { force: true }); // the original already lives in remote storage
+      else { try { fs.writeFileSync(skip, reason); } catch (_) {} }
+    };
+    try {
+      if (!exists(src)) return;
+      // HDR (iPhone Dolby Vision/HLG) would look washed out when flattened to 8-bit SDR -- keep those untouched.
+      const info = await ffmpegInfo(src);
+      if (/smpte2084|arib-std-b67/i.test(info)) return keepOriginal("hdr");
+      await encode(src, tmp);
+      const before = fs.statSync(src).size;
+      const after = fs.statSync(tmp).size;
+      if (after > before * (1 - KEEP_IF_SAVING_BELOW)) { fs.rmSync(tmp, { force: true }); return keepOriginal("no-gain"); }
+      if (remote) {
+        await remote.upload(name, tmp);
+        fs.rmSync(tmp, { force: true });
+      } else {
+        fs.renameSync(tmp, done);
       }
-      res.status(206).set("Content-Range", `bytes ${start}-${end}/${file.length}`);
+      fs.rmSync(src, { force: true });
+      console.log(`[media] compressed ${name}: ${(before / 1048576).toFixed(1)}MB -> ${(after / 1048576).toFixed(1)}MB`);
+    } catch (error) {
+      console.error(`[media] could not compress ${name}:`, error.message);
+      fs.rmSync(tmp, { force: true });
+      keepOriginal("failed");
     }
-    res.set("Content-Length", String(file.length ? end - start + 1 : 0));
-    if (!file.length) return res.end();
-    const stream = bucket.openDownloadStream(file._id, { start, end: end + 1 });
-    res.on("close", () => stream.destroy());
-    stream.on("error", () => res.destroy());
-    stream.pipe(res);
-  } catch (error) { next(error); }
+  }
+
+  function pump() {
+    while (running < VIDEO_CONCURRENCY && queue.length) {
+      const name = queue.shift();
+      running++;
+      run(name).finally(() => { running--; queued.delete(name); pump(); });
+    }
+  }
+
+  function enqueue(name) {
+    if (!VIDEO_ON || !ffmpegPath || queued.has(name) || !isVideoFile(name)) return;
+    const base = baseOf(name);
+    if (exists(p(`${base}.c.mp4`)) || exists(p(`${base}.skip`))) return;
+    queued.add(name);
+    queue.push(name);
+    pump();
+  }
+
+  // After a restart: pick up videos that were uploaded but not compressed yet.
+  function resumePending() {
+    if (remote) {
+      // Temporary files from before a restart: the originals are already in remote storage, so just clean up.
+      try { for (const name of fs.readdirSync(dir)) fs.rmSync(p(name), { force: true, recursive: true }); } catch (_) {}
+      return;
+    }
+    if (!VIDEO_ON || !ffmpegPath) return;
+    try {
+      for (const name of fs.readdirSync(dir)) if (isVideoFile(name) && !/\.(c|tmp)\.mp4$/.test(name)) enqueue(name);
+      for (const name of fs.readdirSync(dir)) if (/\.tmp\.mp4$/.test(name)) fs.rmSync(p(name), { force: true });
+    } catch (_) {}
+  }
+
+  return { enqueue, compressedFor, isPending, resumePending, isVideoFile, available: VIDEO_ON && Boolean(ffmpegPath) };
 }
 
-module.exports = { storeUpload, deleteByUrl, serveUpload, UploadError, MAX_UPLOAD_BYTES, ALLOWED_UPLOAD_PREFIXES };
+module.exports = { optimizeImage, optimizeAvatar, makeAvatarThumb, createVideoCompressor, extFor, isVideoFile };
