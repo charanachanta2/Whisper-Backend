@@ -688,6 +688,19 @@ app.delete("/api/posts/:postId", auth, async (req, res, next) => {
 // The picker in the app enforces this too, but the server is the real gate.
 const MAX_VIDEO_SEC = 60;
 const PHOTO_LIMITS = { post: { min: 15, max: 30, def: 15 }, story: { min: 3, max: 15, def: 5 } };
+const isVideoMedia = (media) => Boolean(media) && String(media.mimeType || "").startsWith("video/");
+// A video can be at most MAX_VIDEO_SEC seconds long (1s of slack for rounding on the phone).
+function videoTooLong(media, duration) {
+  const n = Number(duration);
+  return isVideoMedia(media) && Number.isFinite(n) && n > MAX_VIDEO_SEC + 1;
+}
+// How long a post/story plays. Photos: the chosen time, kept inside the limits for that kind. Videos: their length, up to the cap.
+function cleanDuration(kind, media, raw) {
+  const n = Number(raw);
+  if (isVideoMedia(media)) return Number.isFinite(n) && n > 0 ? Math.min(MAX_VIDEO_SEC, Math.round(n * 10) / 10) : null;
+  const lim = PHOTO_LIMITS[kind] || PHOTO_LIMITS.post;
+  return Number.isFinite(n) && n > 0 ? Math.min(lim.max, Math.max(lim.min, Math.round(n))) : lim.def;
+}
 const MIN_MUSIC_WINDOW_SEC = 5;
 const MAX_MUSIC_WINDOW_SEC = 90; // longest part of a song one post/story can use
 const MAX_SONG_SEC = 60 * 60;

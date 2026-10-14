@@ -14,6 +14,7 @@ const io = new Server(server, { serveClient: false, cors: { origin: CLIENT_ORIGI
 app.locals.io = io;
 const id = (prefix = "") => prefix + crypto.randomBytes(12).toString("hex");
 const inRoom = (room, userId) => room && room.members.includes(userId);
+const EDIT_WINDOW_MS = 5 * 60 * 1000; // messages can be edited for 5 minutes after sending
 // Short copy of a message stored inside a reply, so the quote renders without looking the original up.
 const replySnapshot = (m) => ({
   id: m.id, userId: m.userId, userName: m.userName, type: m.type,
@@ -139,6 +140,70 @@ io.on("connection", socket => {
     } catch (error) {
       console.error(error);
       ack({ ok: false, error: "Could not delete the message. Please try again." });
+    }
+  });
+  // Delete several of your own messages at once (multi-select). Emits one `message_deleted` per message,
+  // so clients need no new handler. Ack: { ok, deleted: [ids], skipped: [ids] }.
+  socket.on("delete_messages", async ({ roomId, messageIds } = {}, callback) => {
+    const ack = typeof callback === "function" ? callback : () => {};
+    try {
+      if (!Array.isArray(messageIds) || !messageIds.length) return ack({ ok: false, error: "Nothing selected." });
+      const wanted = new Set(messageIds.slice(0, 100).map(String));
+      const db = await helpers.loadState(); const room = db.rooms.find(r => r.id === roomId);
+      if (!inRoom(room, socket.user.id)) return ack({ ok: false, error: "You are not a member of this chat." });
+      const removed = [];
+      db.messages = db.messages.filter(m => {
+        if (m.roomId === roomId && wanted.has(m.id) && m.userId === socket.user.id) { removed.push(m); return false; }
+        return true;
+      });
+      const removedIds = new Set(removed.map(m => m.id));
+      const touchedBy = new Map(); // deleted id -> [reply ids updated]
+      for (const m of db.messages) {
+        if (m.roomId === roomId && m.replyTo && removedIds.has(m.replyTo.id)) {
+          const orig = removed.find(r => r.id === m.replyTo.id);
+          m.replyTo = { id: orig.id, userId: orig.userId, userName: orig.userName, type: "deleted", text: "" };
+          if (!touchedBy.has(orig.id)) touchedBy.set(orig.id, []);
+          touchedBy.get(orig.id).push(m.id);
+        }
+      }
+      await helpers.saveState(db);
+      for (const message of removed) {
+        if (message.uri || message.url) helpers.deleteMedia(socket.user.id, { url: message.uri || message.url, thumbUrl: message.thumbUrl || null });
+        io.to(roomId).emit("message_deleted", { roomId, messageId: message.id, repliesUpdated: touchedBy.get(message.id) || [] });
+      }
+      ack({ ok: true, deleted: removed.map(m => m.id), skipped: [...wanted].filter(x => !removedIds.has(x)) });
+    } catch (error) {
+      console.error(error);
+      ack({ ok: false, error: "Could not delete the messages. Please try again." });
+    }
+  });
+  // Edit your own text message, but only within 5 minutes of sending it. After that only delete is possible.
+  socket.on("edit_message", async ({ roomId, messageId, text } = {}, callback) => {
+    const ack = typeof callback === "function" ? callback : () => {};
+    try {
+      const next = String(text || "").trim().slice(0, 4000);
+      if (!next) return ack({ ok: false, error: "Message can't be empty." });
+      const db = await helpers.loadState(); const room = db.rooms.find(r => r.id === roomId);
+      if (!inRoom(room, socket.user.id)) return ack({ ok: false, error: "You are not a member of this chat." });
+      const message = db.messages.find(m => m.id === String(messageId) && m.roomId === roomId);
+      if (!message) return ack({ ok: false, error: "Message not found." });
+      if (message.userId !== socket.user.id) return ack({ ok: false, error: "You can only edit your own messages." });
+      if (message.type !== "text") return ack({ ok: false, error: "Only text messages can be edited." });
+      if (Date.now() - new Date(message.createdAt).getTime() > EDIT_WINDOW_MS) return ack({ ok: false, error: "You can only edit a message within 5 minutes of sending it.", expired: true });
+      if (next === message.text) return ack({ ok: true, message });
+      message.text = next;
+      message.editedAt = new Date().toISOString();
+      // Keep quotes of this message in sync.
+      const repliesUpdated = [];
+      for (const m of db.messages) {
+        if (m.roomId === roomId && m.replyTo && m.replyTo.id === message.id) { m.replyTo = replySnapshot(message); repliesUpdated.push(m.id); }
+      }
+      await helpers.saveState(db);
+      io.to(roomId).emit("message_edited", { roomId, messageId: message.id, text: message.text, editedAt: message.editedAt, repliesUpdated });
+      ack({ ok: true, message });
+    } catch (error) {
+      console.error(error);
+      ack({ ok: false, error: "Could not edit the message. Please try again." });
     }
   });
   // One reaction per person per message (like WhatsApp): tapping a different emoji

@@ -29,3 +29,15 @@ Emit `delete_message` with `{ roomId, messageId }`. Only the sender can delete t
 
 `room_state` and `/api/rooms/...` already include `replyTo` and `reactions`, so history loads with them.
 Messages sent before this update have no `replyTo`/`reactions`: treat missing as `null` / `[]`.
+
+## Edit (own text messages, 5 minutes)
+Emit `edit_message` with `{ roomId, messageId, text }`.
+
+- Only the sender, only `type: "text"`, and only within 5 minutes of `createdAt` (checked on the server).
+  After that the ack is `{ ok:false, expired:true, error }`; delete is still allowed.
+- Server broadcasts `message_edited` `{ roomId, messageId, text, editedAt, repliesUpdated: [messageIds] }`.
+  Update the text, set `editedAt` (show an "Edited" label), and refresh the quote text in the listed replies.
+
+## Delete several at once
+Emit `delete_messages` with `{ roomId, messageIds: [...] }` (max 100, own messages only).
+Ack: `{ ok, deleted: [ids], skipped: [ids] }`. Each deleted message is also broadcast as a normal `message_deleted`.
