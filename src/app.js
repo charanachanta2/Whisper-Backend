@@ -560,6 +560,21 @@ app.get("/api/friends", auth, (req, res) => {
 function withFollowFlags(db, me, user) {
   return { ...socialUser(user), followedByMe: isFollowing(db, me, user.id), followsMe: isFollowing(db, user.id, me) };
 }
+// Someone else's profile: public details, follow state, counts and the posts this viewer is allowed to see
+// (posts follow the usual rules: you see a person's posts once you follow them, and only if the audience includes you).
+app.get("/api/profile/:userId", auth, (req, res) => {
+  const db = req.db, me = req.user.id;
+  const user = db.users.find(u => u.id === req.params.userId && u.active !== false);
+  if (!user) return res.status(404).json({ error: "This profile isn't available." });
+  const posts = db.posts.filter(p => p.userId === user.id && canViewItem(db, me, p)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 100).map(p => postForClient(db, p, me));
+  res.json({
+    user: { ...withFollowFlags(db, me, user), bio: user.bio || "", isMe: user.id === me },
+    followersCount: followerIds(db, user.id).size,
+    followingCount: followingIds(db, user.id).size,
+    posts,
+    postsHidden: user.id !== me && !isFollowing(db, me, user.id), // not following yet, so their posts aren't shown
+  });
+});
 app.get("/api/me/connections", auth, (req, res) => {
   const me = req.user.id;
   const byNewest = (a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || ""));
