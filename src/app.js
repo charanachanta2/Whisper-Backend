@@ -221,6 +221,7 @@ function roomForClient(db, room, viewerId, { withMessages = true } = {}) {
     isVoice: Boolean(room.isVoice),
     otherUser: otherUser ? publicUser(otherUser) : null,
     memberCount: room.members.length,
+    background: room.background || null, // shared chat wallpaper: "color:#rrggbb" or "image:<url>"
     members: room.members.map(uid => db.users.find(u => u.id === uid)).filter(Boolean).map(publicUser),
     messages: withMessages ? lastMessagesFor(db, room.id, 200, clearedAtFor(room, viewerId)) : [],
   };

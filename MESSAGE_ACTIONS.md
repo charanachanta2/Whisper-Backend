@@ -41,3 +41,8 @@ Emit `edit_message` with `{ roomId, messageId, text }`.
 ## Delete several at once
 Emit `delete_messages` with `{ roomId, messageIds: [...] }` (max 100, own messages only).
 Ack: `{ ok, deleted: [ids], skipped: [ids] }`. Each deleted message is also broadcast as a normal `message_deleted`.
+
+## Chat background (shared)
+`room_state` / `/api/rooms` rooms now include `background`: `null`, `"color:#rrggbb"` or `"image:<url>"`.
+Emit `set_chat_background` with `{ roomId, background }` (any member can change it; `null` resets to default).
+Server broadcasts `chat_background` `{ roomId, background, by, byName }` to the room.

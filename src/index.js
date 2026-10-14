@@ -142,6 +142,30 @@ io.on("connection", socket => {
       ack({ ok: false, error: "Could not delete the message. Please try again." });
     }
   });
+  // Shared chat wallpaper: every member of the chat sees it, and any member can change it.
+  // Value: null (default), "color:#rrggbb", or "image:<https url>" (a photo uploaded through /api/upload).
+  socket.on("set_chat_background", async ({ roomId, background } = {}, callback) => {
+    const ack = typeof callback === "function" ? callback : () => {};
+    try {
+      let value = null;
+      if (background !== null && background !== undefined && background !== "") {
+        const raw = String(background).trim();
+        if (/^color:#[0-9a-fA-F]{6}$/.test(raw)) value = raw.toLowerCase();
+        else if (/^image:https?:\/\/\S{4,600}$/i.test(raw)) value = raw;
+        else return ack({ ok: false, error: "That background isn't supported." });
+      }
+      const db = await helpers.loadState(); const room = db.rooms.find(r => r.id === roomId);
+      if (!inRoom(room, socket.user.id)) return ack({ ok: false, error: "You are not a member of this chat." });
+      room.background = value;
+      room.backgroundBy = socket.user.id;
+      await helpers.saveState(db);
+      io.to(roomId).emit("chat_background", { roomId, background: value, by: socket.user.id, byName: socket.user.name });
+      ack({ ok: true, background: value });
+    } catch (error) {
+      console.error(error);
+      ack({ ok: false, error: "Could not change the background. Please try again." });
+    }
+  });
   // Delete several of your own messages at once (multi-select). Emits one `message_deleted` per message,
   // so clients need no new handler. Ack: { ok, deleted: [ids], skipped: [ids] }.
   socket.on("delete_messages", async ({ roomId, messageIds } = {}, callback) => {
