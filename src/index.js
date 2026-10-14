@@ -75,7 +75,7 @@ io.on("connection", socket => {
   // Accepts an optional ack callback so the client can tell a message was
   // actually persisted and broadcast, rather than assuming success the
   // moment it's emitted (socket.emit does not by itself confirm delivery).
-  socket.on("send_message", async ({ roomId, type = "text", text = "", fileName, mimeType, uri, size, url, title, artist, thumbnail, replyToId }, callback) => {
+  socket.on("send_message", async ({ roomId, type = "text", text = "", fileName, mimeType, uri, size, url, title, artist, thumbnail, thumbUrl, width, height, replyToId }, callback) => {
     const ack = typeof callback === "function" ? callback : () => {};
     const MUSIC_LINK_PATTERN = /^https?:\/\/(open\.spotify\.com|music\.apple\.com|music\.youtube\.com|soundcloud\.com)\//i;
     try {
@@ -90,7 +90,7 @@ io.on("connection", socket => {
         if (!original) return ack({ ok: false, error: "The message you're replying to no longer exists." });
         replyTo = replySnapshot(original);
       }
-      const message = { id: id("msg_"), roomId, userId: socket.user.id, userName: socket.user.name, type, text: String(text || "").trim(), fileName: fileName || null, mimeType: mimeType || null, uri: uri || null, size: Number(size) || 0, url: url || null, title: title || null, artist: artist || null, thumbnail: thumbnail || null, replyTo, reactions: [], createdAt: new Date().toISOString() };
+      const message = { id: id("msg_"), roomId, userId: socket.user.id, userName: socket.user.name, type, text: String(text || "").trim(), fileName: fileName || null, mimeType: mimeType || null, uri: uri || null, size: Number(size) || 0, url: url || null, title: title || null, artist: artist || null, thumbnail: thumbnail || null, thumbUrl: typeof thumbUrl === "string" ? thumbUrl : null, width: Number(width) || null, height: Number(height) || null, replyTo, reactions: [], createdAt: new Date().toISOString() };
       db.messages.push(message); if (db.messages.length > 5000) db.messages.splice(0, db.messages.length - 5000);
       await helpers.saveState(db);
       io.to(roomId).emit("new_message", message);
@@ -131,7 +131,7 @@ io.on("connection", socket => {
       }
       await helpers.saveState(db);
       // Remove any photo/video/file from R2 as well (only files inside the sender's own folder).
-      if (message.url) helpers.deleteMedia(socket.user.id, { url: message.url, thumbUrl: typeof message.thumbnail === "string" ? message.thumbnail : null });
+      if (message.uri || message.url) helpers.deleteMedia(socket.user.id, { url: message.uri || message.url, thumbUrl: message.thumbUrl || null });
       io.to(roomId).emit("message_deleted", { roomId, messageId: message.id, repliesUpdated: touched });
       ack({ ok: true, messageId: message.id });
     } catch (error) {
